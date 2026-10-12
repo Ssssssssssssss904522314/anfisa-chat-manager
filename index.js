@@ -30,7 +30,7 @@ const aliases = {
   mute: new Set(["мут", ".мут", "mut"]),
   unmute: new Set(["размут", ".размут", "unmute"]),
   warns: new Set(["варны", ".варны", "warns"]),
-  help: new Set(["помощь", ".помощь", "help", "команды", ".команды"]),
+  help: new Set(["help", "/help", "команды", ".команды"]),
   online: new Set(["онлайн", ".онлайн"]),
   serviceHelp: new Set(["помощь", ".помощь"]),
   ping: new Set(["пинг", ".пинг"]),
