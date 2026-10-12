@@ -17,8 +17,11 @@ if (!TOKEN) {
 const API = `https://api.telegram.org/bot${TOKEN}`;
 const DATA_FILE = path.resolve(process.env.DATA_FILE || "./data.json");
 const MAX_WARNS = 3;
+const SERVICE_CHAT_ID = process.env.SERVICE_CHAT_ID || "";
+const HELPER_USER_IDS = new Set((process.env.HELPER_USER_IDS || "").split(",").map((v) => v.trim()).filter(Boolean));
+const GRID_BAN_CONCURRENCY = 5;
 let offset = 0;
-let state = { warnings: {} };
+let state = { warnings: {}, groupIds: [], helperLastSeen: {} };
 let saving = Promise.resolve();
 
 const aliases = {
@@ -27,18 +30,22 @@ const aliases = {
   mute: new Set(["мут", ".мут", "mut"]),
   unmute: new Set(["размут", ".размут", "unmute"]),
   warns: new Set(["варны", ".варны", "warns"]),
-  help: new Set(["помощь", ".помощь", "help", "команды", ".команды"]),
+  help: new Set(["help", "/help", "команды", ".команды"]),
+  online: new Set(["онлайн", ".онлайн"]),
+  serviceHelp: new Set(["помощь", ".помощь"]),
+  ping: new Set(["пинг", ".пинг"]),
+  gridBan: new Set(["бан сетка", ".бан сетка"]),
 };
 
 async function loadState() {
   try {
     state = JSON.parse(await fs.readFile(DATA_FILE, "utf8"));
-    if (!state || typeof state !== "object" || !state.warnings) {
-      state = { warnings: {} };
-    }
+    if (!state || typeof state !== "object" || !state.warnings) state = { warnings: {} };
+    if (!Array.isArray(state.groupIds)) state.groupIds = [];
+    if (!state.helperLastSeen || typeof state.helperLastSeen !== "object") state.helperLastSeen = {};
   } catch (error) {
     if (error.code !== "ENOENT") console.error("Could not load data.json:", error);
-    state = { warnings: {} };
+    state = { warnings: {}, groupIds: [], helperLastSeen: {} };
   }
 }
 
@@ -65,11 +72,12 @@ async function api(method, payload = {}) {
   return result.result;
 }
 
-async function send(chatId, text, replyToMessageId) {
+async function send(chatId, text, replyToMessageId, parseMode) {
   return api("sendMessage", {
     chat_id: chatId,
     text,
     ...(replyToMessageId ? { reply_to_message_id: replyToMessageId } : {}),
+    ...(parseMode ? { parse_mode: parseMode } : {}),
     disable_web_page_preview: true,
   });
 }
@@ -110,6 +118,108 @@ function reasonSuffix(reason) {
   return reason ? `\nПричина: ${reason}` : "";
 }
 
+async function handleServiceCommand(message, parsed) {
+  const chatId = String(message.chat.id);
+  const sender = message.from;
+  if (!SERVICE_CHAT_ID || chatId !== SERVICE_CHAT_ID) return false;
+
+  if (!["online", "serviceHelp", "ping", "gridBan"].includes(parsed.action)) return false;
+
+  // Only configured helpers and group administrators can use the service controls.
+  let authorized = HELPER_USER_IDS.has(String(sender.id));
+  if (!authorized) {
+    try { authorized = await isAdmin(message.chat.id, sender.id); }
+    catch { authorized = false; }
+  }
+  if (!authorized) {
+    await send(message.chat.id, "⛔ Эта служебная команда доступна только помощникам и администраторам.");
+    return true;
+  }
+
+  if (parsed.action === "online") {
+    const now = Date.now();
+    const lines = [...HELPER_USER_IDS].map((id) => {
+      const last = Number(state.helperLastSeen[id] || 0);
+      const active = last && now - last <= 15 * 60 * 1000;
+      const mention = `<a href="tg://user?id=${id}">Помощник ${id}</a>`;
+      return `${active ? "🟢 активен недавно" : "⚪ не отмечался 15 минут"} — ${mention}`;
+    });
+    await send(message.chat.id,
+      lines.length ? "👥 <b>Помощники Anfisa</b>\\nСтатус основан на активности в сообщениях боту, а не на реальном статусе Telegram Online.\\n\\n" + lines.join("\\n")
+        : "Список помощников не настроен. Добавьте их Telegram ID в HELPER_USER_IDS.",
+      message.message_id, "HTML");
+    return true;
+  }
+
+  if (parsed.action === "serviceHelp") {
+    const mentions = [...HELPER_USER_IDS].map((id) => `<a href="tg://user?id=${id}">помощник</a>`).join(" ");
+    await send(message.chat.id,
+      `🆘 ${mentions || "Помощники не настроены"}\\nНужна помощь в служебном чате. Запрос от <a href="tg://user?id=${sender.id}">${escapeHtml(displayName(sender))}</a>.`,
+      message.message_id, "HTML");
+    return true;
+  }
+
+  if (parsed.action === "ping") {
+    const start = process.hrtime.bigint();
+    const sent = await send(message.chat.id, "🏓 Проверяю отклик…", message.message_id);
+    const elapsedNs = process.hrtime.bigint() - start;
+    const ms = Number(elapsedNs) / 1e6;
+    const edited = `🏓 <b>Pong!</b>\\nВремя ответа Telegram API: <code>${ms.toFixed(2)} мс</code>\\nЛокальное измерение: <code>${elapsedNs.toString()} нс</code> (наносекунды не означают точность сетевого измерения).`;
+    await api("editMessageText", { chat_id: message.chat.id, message_id: sent.message_id, text: edited, parse_mode: "HTML", disable_web_page_preview: true });
+    return true;
+  }
+
+  if (parsed.action === "gridBan") {
+    const target = message.reply_to_message?.from;
+    const idText = parsed.reason.match(/\\d+/)?.[0];
+    const targetId = target?.id || (idText ? Number(idText) : null);
+    if (!targetId || !Number.isSafeInteger(Number(targetId))) {
+      await send(message.chat.id, "Ответьте на сообщение пользователя командой <code>.бан сетка</code> или укажите его Telegram ID: <code>.бан сетка 123456789</code>.", message.message_id, "HTML");
+      return true;
+    }
+    if (Number(targetId) === Number(sender.id) || (target && target.is_bot)) {
+      await send(message.chat.id, "Нельзя заблокировать самого себя или бота.", message.message_id);
+      return true;
+    }
+    if (target && target.id !== Number(targetId)) {
+      await send(message.chat.id, "Не удалось определить пользователя.", message.message_id);
+      return true;
+    }
+
+    const groups = [...new Set((state.groupIds || []).map(String))].filter((id) => id !== SERVICE_CHAT_ID);
+    if (!groups.length) {
+      await send(message.chat.id, "Пока нет известных групп. Бот должен получить хотя бы одно обновление из каждой группы, а также иметь там право банить участников.", message.message_id);
+      return true;
+    }
+    await send(message.chat.id, `🔎 Начинаю глобальную блокировку ID <code>${targetId}</code> в ${groups.length} известных группах…`, message.message_id, "HTML");
+    let banned = 0;
+    let failed = 0;
+    for (let i = 0; i < groups.length; i += GRID_BAN_CONCURRENCY) {
+      const batch = groups.slice(i, i + GRID_BAN_CONCURRENCY);
+      const results = await Promise.allSettled(batch.map(async (groupId) => {
+        const member = await api("getChatMember", { chat_id: groupId, user_id: Number(targetId) });
+        if (["creator", "administrator"].includes(member.status) || member.user?.is_bot) {
+          throw new Error("protected member");
+        }
+        await api("banChatMember", { chat_id: groupId, user_id: Number(targetId) });
+      }));
+      for (const result of results) {
+        if (result.status === "fulfilled") banned++;
+        else failed++;
+      }
+    }
+    await send(message.chat.id,
+      `🛡 <b>Глобальная блокировка завершена</b>\\nID: <code>${targetId}</code>\\nУспешно заблокирован в группах: <b>${banned}</b>\\nНе удалось / защищённые участники: <b>${failed}</b>\\n\\nБот знает только группы, из которых получал обновления, и где у него есть права администратора.`,
+      message.message_id, "HTML");
+    return true;
+  }
+  return false;
+}
+
+function escapeHtml(value = "") {
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 async function handleUpdate(update) {
   const message = update.message;
   if (!message?.chat || !message.from || typeof message.text !== "string") return;
@@ -117,10 +227,26 @@ async function handleUpdate(update) {
   const chat = message.chat;
   const sender = message.from;
   if (chat.type !== "group" && chat.type !== "supergroup") return;
-  if (ALLOWED_CHAT_IDS.size && !ALLOWED_CHAT_IDS.has(String(chat.id))) return;
+
+  // Remember groups where Telegram has delivered an update. Persist helper activity for .онлайн.
+  if (!Array.isArray(state.groupIds)) state.groupIds = [];
+  if (!state.groupIds.includes(String(chat.id))) {
+    state.groupIds.push(String(chat.id));
+    await saveState();
+  }
+  if (HELPER_USER_IDS.has(String(sender.id))) {
+    state.helperLastSeen[sender.id] = Date.now();
+    await saveState();
+  }
 
   const parsed = parseCommand(message.text);
   if (!parsed) return;
+
+  if (await handleServiceCommand(message, parsed)) return;
+
+  // Service-only commands never run in ordinary groups, even if the bot is an admin there.
+  if (["online", "serviceHelp", "ping", "gridBan"].includes(parsed.action)) return;
+  if (ALLOWED_CHAT_IDS.size && !ALLOWED_CHAT_IDS.has(String(chat.id))) return;
 
   if (parsed.action === "help") {
     if (!(await isAdmin(chat.id, sender.id))) return;
