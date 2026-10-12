@@ -145,7 +145,7 @@ async function handleServiceCommand(message, parsed) {
       return `${active ? "🟢 активен недавно" : "⚪ не отмечался 15 минут"} — ${mention}`;
     });
     await send(message.chat.id,
-      lines.length ? "👥 <b>Помощники Anfisa</b>\\nСтатус основан на активности в сообщениях боту, а не на реальном статусе Telegram Online.\\n\\n" + lines.join("\\n")
+      lines.length ? "👥 <b>Помощники Anfisa</b>\nСтатус основан на активности в сообщениях боту, а не на реальном статусе Telegram Online.\n\n" + lines.join("\n")
         : "Список помощников не настроен. Добавьте их Telegram ID в HELPER_USER_IDS.",
       message.message_id, "HTML");
     return true;
@@ -154,7 +154,7 @@ async function handleServiceCommand(message, parsed) {
   if (parsed.action === "serviceHelp") {
     const mentions = [...HELPER_USER_IDS].map((id) => `<a href="tg://user?id=${id}">помощник</a>`).join(" ");
     await send(message.chat.id,
-      `🆘 ${mentions || "Помощники не настроены"}\\nНужна помощь в служебном чате. Запрос от <a href="tg://user?id=${sender.id}">${escapeHtml(displayName(sender))}</a>.`,
+      `🆘 ${mentions || "Помощники не настроены"}\nНужна помощь в служебном чате. Запрос от <a href="tg://user?id=${sender.id}">${escapeHtml(displayName(sender))}</a>.`,
       message.message_id, "HTML");
     return true;
   }
@@ -164,14 +164,14 @@ async function handleServiceCommand(message, parsed) {
     const sent = await send(message.chat.id, "🏓 Проверяю отклик…", message.message_id);
     const elapsedNs = process.hrtime.bigint() - start;
     const ms = Number(elapsedNs) / 1e6;
-    const edited = `🏓 <b>Pong!</b>\\nВремя ответа Telegram API: <code>${ms.toFixed(2)} мс</code>\\nЛокальное измерение: <code>${elapsedNs.toString()} нс</code> (наносекунды не означают точность сетевого измерения).`;
+    const edited = `🏓 <b>Pong!</b>\nВремя ответа Telegram API: <code>${ms.toFixed(2)} мс</code>\nЛокальное измерение: <code>${elapsedNs.toString()} нс</code> (наносекунды не означают точность сетевого измерения).`;
     await api("editMessageText", { chat_id: message.chat.id, message_id: sent.message_id, text: edited, parse_mode: "HTML", disable_web_page_preview: true });
     return true;
   }
 
   if (parsed.action === "gridBan") {
     const target = message.reply_to_message?.from;
-    const idText = parsed.reason.match(/\\d+/)?.[0];
+    const idText = parsed.reason.match(/\d+/)?.[0];
     const targetId = target?.id || (idText ? Number(idText) : null);
     if (!targetId || !Number.isSafeInteger(Number(targetId))) {
       await send(message.chat.id, "Ответьте на сообщение пользователя командой <code>.бан сетка</code> или укажите его Telegram ID: <code>.бан сетка 123456789</code>.", message.message_id, "HTML");
@@ -209,7 +209,7 @@ async function handleServiceCommand(message, parsed) {
       }
     }
     await send(message.chat.id,
-      `🛡 <b>Глобальная блокировка завершена</b>\\nID: <code>${targetId}</code>\\nУспешно заблокирован в группах: <b>${banned}</b>\\nНе удалось / защищённые участники: <b>${failed}</b>\\n\\nБот знает только группы, из которых получал обновления, и где у него есть права администратора.`,
+      `🛡 <b>Глобальная блокировка завершена</b>\nID: <code>${targetId}</code>\nУспешно заблокирован в группах: <b>${banned}</b>\nНе удалось / защищённые участники: <b>${failed}</b>\n\nБот знает только группы, из которых получал обновления, и где у него есть права администратора.`,
       message.message_id, "HTML");
     return true;
   }
