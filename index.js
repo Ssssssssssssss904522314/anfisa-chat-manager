@@ -463,7 +463,7 @@ async function handleUpdate(update) {
   }
 
   if (!parsed) return;
-  if (["buy", "transfer", "service", "balance"].includes(parsed.action)) { await handleCoinCommand(message, parsed); return; }
+  if (["buy", "transfer", "service", "balance", "grant"].includes(parsed.action)) { await handleCoinCommand(message, parsed); return; }
 
   if (await handleServiceCommand(message, parsed)) return;
 
