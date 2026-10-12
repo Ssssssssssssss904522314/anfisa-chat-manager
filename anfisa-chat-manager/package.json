@@ -1,0 +1,13 @@
+{
+  "name": "anfisa-chat-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Anfisa | CHAT-MANAGER — standalone Telegram group moderation bot",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
