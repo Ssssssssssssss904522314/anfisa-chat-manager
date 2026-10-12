@@ -18,6 +18,7 @@ const API = `https://api.telegram.org/bot${TOKEN}`;
 const DATA_FILE = path.resolve(process.env.DATA_FILE || "./data.json");
 const MAX_WARNS = 3;
 const SERVICE_CHAT_ID = process.env.SERVICE_CHAT_ID || "";
+const BOT_OWNER_ID = String(process.env.BOT_OWNER_ID || "").trim();
 const HELPER_USER_IDS = new Set((process.env.HELPER_USER_IDS || "").split(",").map((v) => v.trim()).filter(Boolean));
 const GRID_BAN_CONCURRENCY = 5;
 let offset = 0;
@@ -39,6 +40,7 @@ const aliases = {
   transfer: new Set(["передать", ".передать"]),
   service: new Set(["услуга", ".услуга"]),
   balance: new Set(["баланс", ".баланс"]),
+  grant: new Set(["начислить", ".начислить"]),
 };
 
 async function loadState() {
@@ -266,6 +268,32 @@ async function handleCoinPaymentUpdate(update) {
 async function handleCoinCommand(message, parsed) {
   const chatId = message.chat.id, sender = message.from, args = parsed.reason || "";
   const parts = args.split(/\s+/).filter(Boolean);
+
+  if (parsed.action === "grant") {
+    if (!BOT_OWNER_ID || String(sender.id) !== BOT_OWNER_ID) {
+      await send(chatId, "⛔ Начислять Анфисокоины может только владелец бота.", message.message_id);
+      return true;
+    }
+    const target = message.reply_to_message?.from;
+    const values = parts.map(positiveInt).filter((n) => n !== null);
+    let targetId, amount;
+    if (target && values.length >= 1) {
+      targetId = target.id;
+      amount = values[0];
+    } else if (values.length >= 2) {
+      targetId = values[0];
+      amount = values[1];
+    }
+    if (!targetId || !amount || target?.is_bot || Number(targetId) <= 0) {
+      await send(chatId, "Использование:\n• Ответьте на сообщение пользователя: .начислить количество\n• Или укажите ID: .начислить USER_ID количество\nПример: .начислить 123456789 100", message.message_id);
+      return true;
+    }
+    state.balances[String(targetId)] = coinBalance(targetId) + amount;
+    await saveState();
+    await send(chatId, "✅ Владелец начислил " + amount + " Анфисокоинов пользователю ID " + targetId + ".\nНовый баланс: " + coinBalance(targetId) + " АК.", message.message_id);
+    return true;
+  }
+
   if (parsed.action === "balance") {
     await send(chatId, "🪙 Баланс: " + coinBalance(sender.id) + " Анфисокоинов (АК).", message.message_id);
     return true;
@@ -417,7 +445,7 @@ async function handleUpdate(update) {
   const sender = message.from;
   const parsed = parseCommand(message.text);
   if (chat.type === "private") {
-    if (parsed && ["buy", "transfer", "service", "balance"].includes(parsed.action)) await handleCoinCommand(message, parsed);
+    if (parsed && ["buy", "transfer", "service", "balance", "grant"].includes(parsed.action)) await handleCoinCommand(message, parsed);
     else if (parsed?.action === "help") await send(chat.id, "Anfisa | CHAT-MANAGER\n\n.покупка 10 — купить Анфисокоины за ⭐\n.баланс — баланс\n.передать количество — ответом на сообщение\n.услуга — платные услуги.", message.message_id);
     return;
   }
