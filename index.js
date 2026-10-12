@@ -21,7 +21,7 @@ const SERVICE_CHAT_ID = process.env.SERVICE_CHAT_ID || "";
 const HELPER_USER_IDS = new Set((process.env.HELPER_USER_IDS || "").split(",").map((v) => v.trim()).filter(Boolean));
 const GRID_BAN_CONCURRENCY = 5;
 let offset = 0;
-let state = { warnings: {}, groupIds: [], helperLastSeen: {} };
+let state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [] };
 let saving = Promise.resolve();
 
 const aliases = {
@@ -35,6 +35,10 @@ const aliases = {
   serviceHelp: new Set(["помощь", ".помощь"]),
   ping: new Set(["пинг", ".пинг"]),
   gridBan: new Set(["бан сетка", ".бан сетка"]),
+  buy: new Set(["покупка", ".покупка"]),
+  transfer: new Set(["передать", ".передать"]),
+  service: new Set(["услуга", ".услуга"]),
+  balance: new Set(["баланс", ".баланс"]),
 };
 
 async function loadState() {
@@ -43,9 +47,11 @@ async function loadState() {
     if (!state || typeof state !== "object" || !state.warnings) state = { warnings: {} };
     if (!Array.isArray(state.groupIds)) state.groupIds = [];
     if (!state.helperLastSeen || typeof state.helperLastSeen !== "object") state.helperLastSeen = {};
+    if (!state.balances || typeof state.balances !== "object") state.balances = {};
+    if (!Array.isArray(state.processedPayments)) state.processedPayments = [];
   } catch (error) {
     if (error.code !== "ENOENT") console.error("Could not load data.json:", error);
-    state = { warnings: {}, groupIds: [], helperLastSeen: {} };
+    state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [] };
   }
 }
 
@@ -220,12 +226,201 @@ function escapeHtml(value = "") {
   return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+
+const COIN_PACKAGES = new Map([[10, 15], [15, 20], [20, 35], [35, 40]]);
+const SERVICE_PRICES = { разварн: 10, разбан: 15, размут: 19 };
+const GRID_SERVICE_PRICE = 65;
+function coinBalance(id) { return Number(state.balances[String(id)] || 0); }
+function positiveInt(value) {
+  if (!/^\d+$/.test(String(value || ""))) return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+async function handleCoinPaymentUpdate(update) {
+  if (update.pre_checkout_query) {
+    const q = update.pre_checkout_query;
+    const m = /^anfisakoiny:(\d+):(\d+):(\d+)$/.exec(q.invoice_payload || "");
+    const valid = m && String(q.from.id) === m[1] && COIN_PACKAGES.get(Number(m[2])) === Number(m[3]) && q.currency === "XTR" && q.total_amount === Number(m[3]);
+    await api("answerPreCheckoutQuery", valid
+      ? { pre_checkout_query_id: q.id, ok: true }
+      : { pre_checkout_query_id: q.id, ok: false, error_message: "Счёт не прошёл проверку. Повторите .покупка." });
+    return true;
+  }
+  const msg = update.message;
+  const pay = msg?.successful_payment;
+  if (!pay) return false;
+  const m = /^anfisakoiny:(\d+):(\d+):(\d+)$/.exec(pay.invoice_payload || "");
+  if (!m || String(msg.from.id) !== m[1] || pay.currency !== "XTR" || pay.total_amount !== Number(m[3]) || COIN_PACKAGES.get(Number(m[2])) !== Number(m[3])) {
+    await send(msg.chat.id, "⚠️ Не удалось автоматически проверить платёж. Обратитесь к администратору бота.");
+    return true;
+  }
+  if (!Array.isArray(state.processedPayments)) state.processedPayments = [];
+  if (state.processedPayments.includes(pay.telegram_payment_charge_id)) return true;
+  state.balances[m[1]] = coinBalance(m[1]) + Number(m[2]);
+  state.processedPayments.push(pay.telegram_payment_charge_id);
+  if (state.processedPayments.length > 5000) state.processedPayments = state.processedPayments.slice(-5000);
+  await saveState();
+  await send(msg.chat.id, "✅ Начислено " + m[2] + " Анфисокоинов 🪙\nБаланс: " + coinBalance(m[1]) + " АК.");
+  return true;
+}
+async function handleCoinCommand(message, parsed) {
+  const chatId = message.chat.id, sender = message.from, args = parsed.reason || "";
+  const parts = args.split(/\s+/).filter(Boolean);
+  if (parsed.action === "balance") {
+    await send(chatId, "🪙 Баланс: " + coinBalance(sender.id) + " Анфисокоинов (АК).", message.message_id);
+    return true;
+  }
+  if (parsed.action === "buy") {
+    const coins = positiveInt(parts[0]);
+    if (!coins || !COIN_PACKAGES.has(coins)) {
+      await send(chatId, "Пакеты:\n10 АК — 15 ⭐\n15 АК — 20 ⭐\n20 АК — 35 ⭐\n35 АК — 40 ⭐\n\nПример: .покупка 10", message.message_id);
+      return true;
+    }
+    const stars = COIN_PACKAGES.get(coins);
+    await api("sendInvoice", {
+      chat_id: chatId, title: coins + " Анфисокоинов",
+      description: "Покупка Анфисокоинов для услуг Anfisa | CHAT-MANAGER.",
+      payload: "anfisakoiny:" + sender.id + ":" + coins + ":" + stars,
+      provider_token: "", currency: "XTR",
+      prices: [{ label: coins + " Анфисокоинов", amount: stars }]
+    });
+    return true;
+  }
+  if (parsed.action === "transfer") {
+    const amount = positiveInt(parts[0]), target = message.reply_to_message?.from;
+    if (!amount || !target) {
+      await send(chatId, "Ответьте на сообщение получателя командой .передать количество", message.message_id);
+      return true;
+    }
+    if (target.is_bot || target.id === sender.id) {
+      await send(chatId, "Нельзя передать коины самому себе или боту.", message.message_id);
+      return true;
+    }
+    if (coinBalance(sender.id) < amount) {
+      await send(chatId, "Недостаточно средств. Баланс: " + coinBalance(sender.id) + " АК.", message.message_id);
+      return true;
+    }
+    state.balances[String(sender.id)] = coinBalance(sender.id) - amount;
+    state.balances[String(target.id)] = coinBalance(target.id) + amount;
+    await saveState();
+    await send(chatId, "✅ Передано " + amount + " АК пользователю " + displayName(target) + ".\nВаш баланс: " + coinBalance(sender.id) + " АК.", message.message_id);
+    return true;
+  }
+  if (parsed.action !== "service") return false;
+  const action = String(parts[0] || "").toLowerCase();
+  if (!["разбан", "размут", "разварн"].includes(action)) {
+    await send(chatId, "Услуги:\n.услуга разварн — 10 АК\n.услуга разбан — 15 АК\n.услуга размут — 19 АК\nДействие по сетке — 65 АК.\nОтветьте на сообщение пользователя; в ЛС укажите ID пользователя и ID чата или @username группы.", message.message_id);
+    return true;
+  }
+  const network = parts.some((p) => ["сетке", "сетка"].includes(p.toLowerCase()));
+  const target = message.reply_to_message?.from;
+  const explicitUserId = parts.map(positiveInt).find((v) => v !== null);
+  const targetId = target?.id || explicitUserId;
+  if (!targetId) {
+    await send(chatId, "Ответьте на сообщение пользователя или укажите его Telegram ID.", message.message_id);
+    return true;
+  }
+  if (Number(targetId) === Number(sender.id) || target?.is_bot) {
+    await send(chatId, "Нельзя применить услугу к себе или боту.", message.message_id);
+    return true;
+  }
+  let groups = [];
+  if (network) {
+    groups = [...new Set((state.groupIds || []).map(String))].filter((id) => id !== SERVICE_CHAT_ID);
+  } else if (message.chat.type === "group" || message.chat.type === "supergroup") {
+    groups = [String(message.chat.id)];
+  } else {
+    const chatArg = parts.find((p) => p.startsWith("@") || p.startsWith("-"));
+    if (!chatArg) {
+      await send(chatId, "В ЛС укажите ID/username группы: .услуга разбан USER_ID CHAT_ID_ИЛИ_@username", message.message_id);
+      return true;
+    }
+    try {
+      const c = await api("getChat", { chat_id: chatArg });
+      if (!["group", "supergroup"].includes(c.type)) throw new Error("not a group");
+      groups = [String(c.id)];
+    } catch {
+      await send(chatId, "Не удалось найти группу. Укажите точный ID или публичный @username; бот должен иметь доступ к группе.", message.message_id);
+      return true;
+    }
+  }
+  if (!groups.length) {
+    await send(chatId, "Нет известных групп для действия по сетке. Коины не списаны.", message.message_id);
+    return true;
+  }
+  const price = network ? GRID_SERVICE_PRICE : SERVICE_PRICES[action];
+  if (coinBalance(sender.id) < price) {
+    await send(chatId, "Услуга стоит " + price + " АК; ваш баланс — " + coinBalance(sender.id) + " АК.", message.message_id);
+    return true;
+  }
+  const me = await api("getMe");
+  const usable = [];
+  for (const groupId of groups) {
+    try {
+      const botMember = await api("getChatMember", { chat_id: groupId, user_id: me.id });
+      if (!["administrator", "creator"].includes(botMember.status)) continue;
+      if (action === "разбан") {
+        usable.push(groupId);
+      } else {
+        const member = await api("getChatMember", { chat_id: groupId, user_id: Number(targetId) });
+        if (!["creator", "administrator"].includes(member.status) && !member.user?.is_bot) usable.push(groupId);
+      }
+    } catch (e) {
+      if (action === "разбан") usable.push(groupId);
+    }
+  }
+  if (!usable.length) {
+    await send(chatId, "Бот не имеет нужных прав или пользователь защищён/не найден. Коины не списаны.", message.message_id);
+    return true;
+  }
+  let success = 0, failed = 0;
+  for (const groupId of usable) {
+    try {
+      if (action === "разбан") {
+        await api("unbanChatMember", { chat_id: groupId, user_id: Number(targetId), only_if_banned: false });
+      } else if (action === "размут") {
+        await api("restrictChatMember", { chat_id: groupId, user_id: Number(targetId), use_independent_chat_permissions: true, permissions: {
+          can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true,
+          can_send_videos: true, can_send_video_notes: true, can_send_voice_notes: true, can_send_polls: true,
+          can_send_other_messages: true, can_add_web_page_previews: true
+        }});
+      } else {
+        for (const key of Object.keys(state.warnings)) {
+          if (network ? key.endsWith(":" + targetId) : key === keyFor(groupId, targetId)) delete state.warnings[key];
+        }
+      }
+      success++;
+    } catch (e) {
+      failed++;
+      console.error("Paid service " + action + " failed in " + groupId + ":", e.message);
+    }
+  }
+  if (success) {
+    state.balances[String(sender.id)] = coinBalance(sender.id) - price;
+    await saveState();
+  }
+  await send(chatId, success
+    ? "✅ Услуга «" + action + (network ? " по сетке" : "") + "» завершена.\nID пользователя: " + targetId + "\nУспешно: " + success + "; ошибки: " + failed + "\nСписано: " + price + " АК.\nБаланс: " + coinBalance(sender.id) + " АК."
+    : "❌ Не удалось выполнить услугу. Коины не списаны.", message.message_id);
+  return true;
+}
+
 async function handleUpdate(update) {
+  if (update.pre_checkout_query || update.message?.successful_payment) {
+    await handleCoinPaymentUpdate(update);
+    if (update.pre_checkout_query) return;
+  }
   const message = update.message;
   if (!message?.chat || !message.from || typeof message.text !== "string") return;
 
   const chat = message.chat;
   const sender = message.from;
+  const parsed = parseCommand(message.text);
+  if (chat.type === "private") {
+    if (parsed && ["buy", "transfer", "service", "balance"].includes(parsed.action)) await handleCoinCommand(message, parsed);
+    else if (parsed?.action === "help") await send(chat.id, "Anfisa | CHAT-MANAGER\n\n.покупка 10 — купить Анфисокоины за ⭐\n.баланс — баланс\n.передать количество — ответом на сообщение\n.услуга — платные услуги.", message.message_id);
+    return;
+  }
   if (chat.type !== "group" && chat.type !== "supergroup") return;
 
   // Remember groups where Telegram has delivered an update. Persist helper activity for .онлайн.
@@ -239,8 +434,8 @@ async function handleUpdate(update) {
     await saveState();
   }
 
-  const parsed = parseCommand(message.text);
   if (!parsed) return;
+  if (["buy", "transfer", "service", "balance"].includes(parsed.action)) { await handleCoinCommand(message, parsed); return; }
 
   if (await handleServiceCommand(message, parsed)) return;
 
@@ -397,7 +592,7 @@ async function main() {
       const updates = await api("getUpdates", {
         offset,
         timeout: 50,
-        allowed_updates: ["message"],
+        allowed_updates: ["message", "pre_checkout_query"],
       });
       for (const update of updates) {
         offset = update.update_id + 1;
