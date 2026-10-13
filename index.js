@@ -19,6 +19,7 @@ const DATA_FILE = path.resolve(process.env.DATA_FILE || "./data.json");
 const DEFAULT_WARN_LIMIT = 3;
 const SERVICE_CHAT_ID = process.env.SERVICE_CHAT_ID || "";
 const BOT_OWNER_ID = String(process.env.BOT_OWNER_ID || "").trim();
+const UPDATE_CHANNEL_ID = String(process.env.UPDATE_CHANNEL_ID || "@anfisa_kanal_bot").trim();
 const HELPER_USER_IDS = new Set((process.env.HELPER_USER_IDS || "").split(",").map((v) => v.trim()).filter(Boolean));
 const GRID_BAN_CONCURRENCY = 5;
 let offset = 0;
@@ -46,6 +47,7 @@ const aliases = {
   warnLimit: new Set(["+варнлимит", "варнлимит", ".варнлимит"]),
   summon: new Set([".позвать", "позвать"]),
   emojiTest: new Set([".эмодзитест", "эмодзитест"]),
+  emojiChannelTest: new Set([".тестэмодзиканал"]),
 };
 
 async function loadState() {
@@ -521,6 +523,64 @@ async function handleEmojiTest(message) {
   return true;
 }
 
+
+async function handleChannelEmojiTest(message) {
+  const senderId = String(message.from?.id || "");
+  const ownerId = BOT_OWNER_ID || String(state.botOwnerId || "");
+  if (!ownerId || senderId !== ownerId) {
+    await send(message.chat.id, ownerId
+      ? "⛔ Команда .тестэмодзиканал доступна только владельцу бота."
+      : "⚙️ Не задан BOT_OWNER_ID. Укажи свой Telegram ID в переменных окружения хостинга и перезапусти бота.");
+    return true;
+  }
+
+  try {
+    const pack = await api("getStickerSet", { name: "NewsEmoji" });
+    const stickers = (pack.stickers || []).filter((item) => item.emoji && item.custom_emoji_id);
+    if (!stickers.length) {
+      await send(message.chat.id, "❌ В наборе NewsEmoji не нашлось премиум-эмодзи с custom_emoji_id.");
+      return true;
+    }
+
+    let text = "🧪 Тест премиум-эмодзи Anfisa | CHAT-MANAGER\\n\\n";
+    const entities = [];
+    const maxTextLength = 4000;
+    let sentCount = 0;
+
+    for (const sticker of stickers) {
+      const separator = sentCount === 0 ? "" : (sentCount % 8 === 0 ? "\\n" : " ");
+      const emoji = sticker.emoji;
+      if (text.length + separator.length + emoji.length > maxTextLength) break;
+
+      text += separator;
+      const offset = text.length;
+      text += emoji;
+      entities.push({
+        type: "custom_emoji",
+        offset,
+        length: emoji.length,
+        custom_emoji_id: sticker.custom_emoji_id
+      });
+      sentCount++;
+    }
+
+    text += "\\n\\nВсего в тесте: " + sentCount + " премиум-эмодзи из набора NewsEmoji.";
+    await api("sendMessage", {
+      chat_id: UPDATE_CHANNEL_ID,
+      text,
+      entities,
+      link_preview_options: { is_disabled: true }
+    });
+    await send(message.chat.id,
+      "✅ Тестовая публикация отправлена в канал.\\nПроверено премиум-эмодзи: " + sentCount + ".\\nЕсли эмодзи не отображаются, убедись, что Anfisa может публиковать сообщения в канале.");
+  } catch (error) {
+    console.error("Channel premium emoji test failed:", error.message);
+    await send(message.chat.id,
+      "❌ Не удалось отправить тест в канал. Проверь, что Anfisa добавлена администратором канала и может публиковать сообщения.\\nДетали: " + error.message);
+  }
+  return true;
+}
+
 async function handleUpdate(update) {
   if (update.pre_checkout_query || update.message?.successful_payment) {
     await handleCoinPaymentUpdate(update);
@@ -547,6 +607,7 @@ async function handleUpdate(update) {
   const parsed = parseCommand(message.text);
   if (chat.type === "private") {
     if (parsed?.action === "emojiTest") { await handleEmojiTest(message); return; }
+    if (parsed?.action === "emojiChannelTest") { await handleChannelEmojiTest(message); return; }
     if (parsed && ["buy", "transfer", "service", "balance", "grant"].includes(parsed.action)) await handleCoinCommand(message, parsed);
     else if (parsed?.action === "help") await send(chat.id, "Anfisa | CHAT-MANAGER\n\n.покупка 10 — купить Анфисокоины за ⭐\n.баланс — баланс\n.передать количество — ответом на сообщение\n.услуга — платные услуги.", message.message_id);
     return;
