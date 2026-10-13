@@ -22,7 +22,7 @@ const BOT_OWNER_ID = String(process.env.BOT_OWNER_ID || "").trim();
 const HELPER_USER_IDS = new Set((process.env.HELPER_USER_IDS || "").split(",").map((v) => v.trim()).filter(Boolean));
 const GRID_BAN_CONCURRENCY = 5;
 let offset = 0;
-let state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [] };
+let state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [], activity: {}, levels: {} };
 let saving = Promise.resolve();
 
 const aliases = {
@@ -41,6 +41,8 @@ const aliases = {
   service: new Set(["услуга", ".услуга"]),
   balance: new Set(["баланс", ".баланс"]),
   grant: new Set(["начислить", ".начислить"]),
+  profile: new Set(["профиль", ".профиль"]),
+  promote: new Set(["повысить", ".повысить"]),
 };
 
 async function loadState() {
@@ -52,9 +54,11 @@ async function loadState() {
     if (!state.balances || typeof state.balances !== "object") state.balances = {};
     if (!Array.isArray(state.processedPayments)) state.processedPayments = [];
     if (typeof state.botOwnerId !== "string") state.botOwnerId = "";
+    if (!state.activity || typeof state.activity !== "object") state.activity = {};
+    if (!state.levels || typeof state.levels !== "object") state.levels = {};
   } catch (error) {
     if (error.code !== "ENOENT") console.error("Could not load data.json:", error);
-    state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [], botOwnerId: "" };
+    state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [], botOwnerId: "", activity: {}, levels: {} };
   }
 }
 
@@ -98,6 +102,27 @@ function displayName(user) {
 
 function keyFor(chatId, userId) {
   return `${chatId}:${userId}`;
+}
+function userLevel(chatId, userId) {
+  return Number(state.levels?.[keyFor(chatId, userId)] || 1);
+}
+function recordActivity(chatId, userId) {
+  if (!state.activity || typeof state.activity !== "object") state.activity = {};
+  const key = keyFor(chatId, userId);
+  const now = Date.now();
+  const events = Array.isArray(state.activity[key]) ? state.activity[key] : [];
+  events.push(now);
+  const yearAgo = now - 365 * 24 * 60 * 60 * 1000;
+  state.activity[key] = events.filter((t) => Number(t) >= yearAgo).slice(-10000);
+}
+function countActivity(chatId, userId, periodMs) {
+  const events = state.activity?.[keyFor(chatId, userId)];
+  if (!Array.isArray(events)) return 0;
+  const since = Date.now() - periodMs;
+  return events.filter((t) => Number(t) >= since).length;
+}
+function levelLabel(level) {
+  return ({1:"Уровень 1 — участник",2:"Уровень 2 — мут и варн",3:"Уровень 3 — бан"})[level] || "Уровень 1 — участник";
 }
 
 function parseCommand(text = "") {
@@ -470,6 +495,8 @@ async function handleUpdate(update) {
   }
   if (chat.type !== "group" && chat.type !== "supergroup") return;
 
+  // Count each message as activity for rolling day/week/month/year statistics.
+  recordActivity(chat.id, sender.id);
   // Remember groups where Telegram has delivered an update. Persist helper activity for .онлайн.
   if (!Array.isArray(state.groupIds)) state.groupIds = [];
   if (!state.groupIds.includes(String(chat.id))) {
@@ -481,8 +508,66 @@ async function handleUpdate(update) {
     await saveState();
   }
 
-  if (!parsed) return;
+  if (!parsed) { await saveState(); return; }
   if (["buy", "transfer", "service", "balance", "grant"].includes(parsed.action)) { await handleCoinCommand(message, parsed); return; }
+
+  if (parsed.action === "profile") {
+    const target = message.reply_to_message?.from || sender;
+    let role = "Участник";
+    try {
+      const member = await api("getChatMember", { chat_id: chat.id, user_id: target.id });
+      if (member.status === "creator") role = "Владелец группы";
+      else if (member.status === "administrator") role = "Администратор группы";
+      else if (["left", "kicked"].includes(member.status)) role = "Не состоит в группе";
+    } catch {}
+    const level = userLevel(chat.id, target.id);
+    const activityText = [
+      "📊 Актив пользователя: " + displayName(target),
+      "День: " + countActivity(chat.id, target.id, 24*60*60*1000) + " сообщ.",
+      "Неделя: " + countActivity(chat.id, target.id, 7*24*60*60*1000) + " сообщ.",
+      "Месяц: " + countActivity(chat.id, target.id, 30*24*60*60*1000) + " сообщ.",
+      "Год: " + countActivity(chat.id, target.id, 365*24*60*60*1000) + " сообщ.",
+      "Статус: " + role,
+      "Права Anfisa: " + levelLabel(level)
+    ].join("\n");
+    await saveState();
+    await send(chat.id, activityText, message.message_id);
+    return;
+  }
+
+  if (parsed.action === "promote") {
+    let actorIsAdmin = false;
+    try { actorIsAdmin = await isAdmin(chat.id, sender.id); } catch {}
+    if (!actorIsAdmin) {
+      await send(chat.id, "⛔ Повышать и понижать уровни могут только администраторы группы.", message.message_id);
+      return;
+    }
+    const target = message.reply_to_message?.from;
+    const match = /(?:до\s*)?([1-3])\s*$/.exec(parsed.reason);
+    if (!target || !match) {
+      await send(chat.id, "Ответьте на сообщение пользователя командой .повысить до 2 (или до 1 / до 3).", message.message_id);
+      return;
+    }
+    if (target.is_bot || target.id === sender.id) {
+      await send(chat.id, "Нельзя назначить уровень самому себе или боту.", message.message_id);
+      return;
+    }
+    try {
+      const member = await api("getChatMember", { chat_id: chat.id, user_id: target.id });
+      if (["creator", "administrator"].includes(member.status)) {
+        await send(chat.id, "У настоящих администраторов и владельца группы права Telegram не меняются этой командой.", message.message_id);
+        return;
+      }
+    } catch {
+      await send(chat.id, "Не удалось проверить пользователя. Убедитесь, что Anfisa — администратор группы.", message.message_id);
+      return;
+    }
+    const level = Number(match[1]);
+    state.levels[keyFor(chat.id, target.id)] = level;
+    await saveState();
+    await send(chat.id, "✅ Для " + displayName(target) + " установлен " + levelLabel(level) + ".", message.message_id);
+    return;
+  }
 
   if (await handleServiceCommand(message, parsed)) return;
 
@@ -507,14 +592,22 @@ async function handleUpdate(update) {
 
   let admin;
   try {
-    admin = await isAdmin(chat.id, sender.id);
+    const telegramAdmin = await isAdmin(chat.id, sender.id);
+    const level = userLevel(chat.id, sender.id);
+    admin = telegramAdmin || (["warn", "mute", "unmute"].includes(parsed.action) && level >= 2) || (parsed.action === "ban" && level >= 3);
   } catch (error) {
     console.error("Could not verify administrator:", error.message);
     await send(chat.id, "Не удалось проверить права администратора. Попробуйте позже.", message.message_id);
     return;
   }
 
-  if (!admin) return;
+  if (!admin) {
+    const level = userLevel(chat.id, sender.id);
+    if (["warn", "mute", "unmute", "ban"].includes(parsed.action)) {
+      await send(chat.id, "⛔ Недостаточно прав. Ваш уровень: " + level + "/3.", message.message_id);
+    }
+    return;
+  }
 
   const target = message.reply_to_message?.from;
   if (!target) {
