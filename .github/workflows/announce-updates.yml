@@ -1,4 +1,4 @@
-name: Automatic bot update announcements
+name: Automatic bot update announcements with generated illustration
 
 on:
   push:
@@ -7,6 +7,7 @@ on:
     paths:
       - 'index.js'
       - 'package.json'
+      - '.github/workflows/announce-updates.yml'
   workflow_dispatch:
     inputs:
       title:
@@ -21,15 +22,21 @@ jobs:
   announce:
     runs-on: ubuntu-latest
     steps:
-      - name: Publish update with relevant premium emoji
+      - name: Prepare image generator
+        run: |
+          python3 -m venv /tmp/anfisa-image-env
+          /tmp/anfisa-image-env/bin/pip install --quiet pillow
+
+      - name: Generate feature diagram and publish update to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           UPDATE_CHANNEL_ID: ${{ secrets.UPDATE_CHANNEL_ID }}
           MANUAL_TITLE: ${{ inputs.title }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json, os, re, urllib.request
+          /tmp/anfisa-image-env/bin/python - <<'PY'
+          import io, json, os, re, urllib.request, uuid
+          from PIL import Image, ImageDraw, ImageFont
 
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
           channel = os.environ.get("UPDATE_CHANNEL_ID", "")
@@ -37,21 +44,33 @@ jobs:
               raise SystemExit("Set TELEGRAM_BOT_TOKEN and UPDATE_CHANNEL_ID in repository Actions secrets.")
 
           api = f"https://api.telegram.org/bot{token}/"
-          def call(method, payload=None):
-              req = urllib.request.Request(
+
+          def call_multipart(method, fields, image_bytes):
+              boundary = "----AnfisaBoundary" + uuid.uuid4().hex
+              parts = []
+              for name, value in fields.items():
+                  parts.append(
+                      f"--{boundary}\r\n"
+                      f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                      f"{value}\r\n"
+                  .encode("utf-8"))
+              parts.append(
+                  f"--{boundary}\r\n"
+                  'Content-Disposition: form-data; name="photo"; filename="anfisa-update.png"\r\n'
+                  "Content-Type: image/png\r\n\r\n"
+                  .encode("utf-8"))
+              parts.append(image_bytes)
+              parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+              request = urllib.request.Request(
                   api + method,
-                  data=json.dumps(payload or {}).encode(),
-                  headers={"Content-Type": "application/json"}
+                  data=b"".join(part if isinstance(part, bytes) else part.encode("utf-8") for part in parts),
+                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
               )
-              with urllib.request.urlopen(req, timeout=20) as response:
+              with urllib.request.urlopen(request, timeout=40) as response:
                   result = json.load(response)
               if not result.get("ok"):
                   raise RuntimeError(f"Telegram {method} failed: {result}")
               return result["result"]
-
-          def normalize(value):
-              # Ignore optional Unicode variation selectors while matching fallback emoji.
-              return value.replace("\ufe0f", "").replace("\ufe0e", "")
 
           title = (os.environ.get("MANUAL_TITLE") or "").strip()
           if not title:
@@ -61,119 +80,177 @@ jobs:
                   title = (event.get("head_commit") or {}).get("message", "").splitlines()[0].strip()
               except (OSError, ValueError, KeyError, IndexError):
                   title = ""
-          title = re.sub(r"^(feat|feature|fix|bugfix|chore|docs|refactor|style|test)(\([^)]*\))?:\s*", "", title, flags=re.IGNORECASE).strip()
-          if not title or title.lower() in {"update index.js", "update package.json", "update announce-updates.yml"}:
+          title = re.sub(
+              r"^(feat|feature|fix|bugfix|chore|docs|refactor|style|test)(\([^)]*\))?:\s*",
+              "", title, flags=re.IGNORECASE
+          ).strip()
+          if not title or title.lower() in {
+              "update index.js", "update package.json", "update announce-updates.yml"
+          }:
               title = "Новое улучшение бота"
 
-          # Keep auto-generated announcement titles in Russian when commit messages are English.
           if not re.search(r"[а-яё]", title, flags=re.IGNORECASE):
-              original_title = title.casefold()
-              if any(word in original_title for word in ("emoji", "announcement", "workflow", "premium")):
-                  title = "Улучшен подбор премиум-эмодзи и публикация обновлений"
-              elif any(word in original_title for word in ("security", "moderation", "ban", "spam", "warn", "mute")):
+              original = title.casefold()
+              if any(word in original for word in ("emoji", "announcement", "workflow", "premium", "image")):
+                  title = "Улучшена публикация обновлений"
+              elif any(word in original for word in ("security", "moderation", "ban", "spam", "warn", "mute")):
                   title = "Улучшены инструменты модерации и безопасности"
-              elif any(word in original_title for word in ("payment", "coin", "stars", "purchase", "balance")):
+              elif any(word in original for word in ("payment", "coin", "stars", "purchase", "balance")):
                   title = "Обновлены покупки и Анфисокоины"
-              elif any(word in original_title for word in ("fix", "bug", "error")):
+              elif any(word in original for word in ("fix", "bug", "error")):
                   title = "Исправлены ошибки бота"
-              elif any(word in original_title for word in ("feat", "feature", "add", "implement", "new")):
+              elif any(word in original for word in ("feat", "feature", "add", "implement", "new")):
                   title = "Добавлена новая функция"
               else:
                   title = "Новое улучшение бота"
+          title = title[:140]
 
-          # Read the emoji-to-custom-ID mapping from the public NewsEmoji pack.
-          pack = call("getStickerSet", {"name": "NewsEmoji"})
-          emoji_map = {}
-          for sticker in pack.get("stickers", []):
-              fallback, custom_id = sticker.get("emoji"), sticker.get("custom_emoji_id")
-              if fallback and custom_id:
-                  emoji_map.setdefault(normalize(fallback), (fallback, custom_id))
-
-          used_keys = set()
-          def choose(candidates, limit):
-              selected = []
-              for candidate in candidates:
-                  key = normalize(candidate)
-                  if key in emoji_map and key not in used_keys:
-                      selected.append(emoji_map[key][0])
-                      used_keys.add(key)
-                      if len(selected) >= limit:
-                          break
-              return selected
-
-          title_lower = title.casefold()
-          security_terms = ("безопас", "защит", "модерац", "бан", "варн", "мут", "спам", "security", "moderation", "ban", "spam")
-          payment_terms = ("оплат", "звезд", "stars", "коин", "coin", "покуп", "платеж", "баланс", "эконом")
-          fix_terms = ("исправ", "ошиб", "баг", "фикс", "fix", "bug", "почин")
-
-          if any(term in title_lower for term in security_terms):
-              topic_candidates = ["🛡️", "🔒", "⛔️", "🚫", "❗️", "👀", "⚡️"]
-          elif any(term in title_lower for term in payment_terms):
-              topic_candidates = ["🛍", "💳", "💰", "🪙", "⭐", "💎", "⚡️"]
-          elif any(term in title_lower for term in fix_terms):
-              topic_candidates = ["✅", "🔧", "🛠️", "⚙️", "🩹", "⚡️", "❗️"]
+          lowered = title.casefold()
+          if any(term in lowered for term in ("варн", "предупрежд", "warn")):
+              section = "СИСТЕМА ПРЕДУПРЕЖДЕНИЙ"
+              steps = [
+                  ("01", "Первый варн", "Участник получает предупреждение"),
+                  ("02", "Второй варн", "Счётчик предупреждений растёт"),
+                  ("03", "Лимит 3 из 3", "Достигнут установленный порог"),
+                  ("04", "Автоматический бан", "Anfisa блокирует участника")
+              ]
+          elif any(term in lowered for term in ("мут", "mute", "огранич")):
+              section = "КАК РАБОТАЕТ МУТ"
+              steps = [
+                  ("01", "Команда модератора", "Ответьте на сообщение участника"),
+                  ("02", "Проверка прав", "Anfisa проверяет разрешение"),
+                  ("03", "Ограничение", "Участник временно не пишет"),
+                  ("04", "Снятие мута", "Права на отправку восстановлены")
+              ]
+          elif any(term in lowered for term in ("разбан", "бан", "security", "безопас", "спам", "moderation", "модерац")):
+              section = "КАК РАБОТАЕТ МОДЕРАЦИЯ"
+              steps = [
+                  ("01", "Событие в чате", "Поступает команда или жалоба"),
+                  ("02", "Проверка прав", "Anfisa проверяет разрешения"),
+                  ("03", "Действие", "Варн, мут или блокировка"),
+                  ("04", "Результат", "Чат остаётся под защитой")
+              ]
+          elif any(term in lowered for term in ("звезд", "stars", "коин", "coin", "покуп", "оплат", "баланс", "услуг")):
+              section = "КАК РАБОТАЮТ АНФИСОКОИНЫ"
+              steps = [
+                  ("01", "Выбор пакета", "Пользователь выбирает количество"),
+                  ("02", "Оплата ⭐", "Платёж проходит в Telegram"),
+                  ("03", "Начисление", "Коины добавляются на баланс"),
+                  ("04", "Покупка услуги", "Баланс списывается за услугу")
+              ]
           else:
-              topic_candidates = ["🚀", "✨", "⚡️", "☄️", "💡", "🆕", "🎉"]
+              section = "КАК РАБОТАЕТ ФУНКЦИЯ"
+              steps = [
+                  ("01", "Команда или событие", "Пользователь запускает действие"),
+                  ("02", "Проверка", "Anfisa проверяет условия и права"),
+                  ("03", "Выполнение", "Бот применяет нужное действие"),
+                  ("04", "Результат", "Ответ приходит прямо в Telegram")
+              ]
 
-          header_icons = choose(["📰", "📣", "🔔", "👀", "❗️"], 2)
-          topic_icons = choose(topic_candidates, 3)
-          footer_icons = choose(["🔔", "🙂", "👋", "💬", "👀"], 1)
+          width, height = 1200, 675
+          image = Image.new("RGB", (width, height))
+          pixels = image.load()
+          for y in range(height):
+              for x in range(width):
+                  glow = max(0, 1 - (((x - 1000) / 850) ** 2 + ((y - 80) / 520) ** 2) ** 0.5)
+                  pixels[x, y] = (
+                      int(7 + 3 * glow),
+                      int(18 + 36 * glow),
+                      int(29 + 30 * glow)
+                  )
 
-          if not header_icons:
-              header_icons = ["📣"]
-          if not topic_icons:
-              topic_icons = ["🚀"]
-          if not footer_icons:
-              footer_icons = ["🔔"]
+          draw = ImageDraw.Draw(image)
+          regular_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+          bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-          text = (
-              f"{' '.join(header_icons)} Anfisa | CHAT-MANAGER\n\n"
-              f"{' '.join(topic_icons)} Новое обновление!\n"
+          def font(size, bold=False):
+              path = bold_path if bold else regular_path
+              try:
+                  return ImageFont.truetype(path, size)
+              except OSError:
+                  return ImageFont.load_default()
+
+          # Decorative network lines and corner rings.
+          for x in range(35, width, 80):
+              draw.line((x, 35, x + 60, 105), fill=(16, 58, 69), width=1)
+          for r in (90, 125, 160):
+              draw.arc((1010-r, 45-r, 1010+r, 45+r), 185, 320, fill=(17, 78, 86), width=2)
+
+          draw.rounded_rectangle((36, 30, 96, 90), radius=18, fill=(21, 219, 163))
+          draw.text((52, 39), "A", font=font(42, True), fill=(7, 22, 32))
+          draw.text((115, 34), "Anfisa", font=font(31, True), fill=(242, 250, 250))
+          draw.text((229, 40), "| CHAT-MANAGER", font=font(25, True), fill=(56, 228, 187))
+          draw.text((115, 73), "УМНЫЙ БОТ ДЛЯ ЧИСТОГО И БЕЗОПАСНОГО ЧАТА", font=font(13), fill=(135, 174, 183))
+
+          draw.text((48, 125), section, font=font(17, True), fill=(63, 232, 188))
+          title_font = font(38, True)
+          words = title.split()
+          lines, current = [], ""
+          for word in words:
+              trial = f"{current} {word}".strip()
+              if draw.textlength(trial, font=title_font) <= 1080:
+                  current = trial
+              else:
+                  if current:
+                      lines.append(current)
+                  current = word
+          if current:
+              lines.append(current)
+          if len(lines) > 2:
+              lines = [lines[0], " ".join(lines[1:])]
+              while draw.textlength(lines[1], font=font(31, True)) > 1060 and len(lines[1]) > 5:
+                  lines[1] = lines[1][:-4].rstrip() + "…"
+          draw.multiline_text((48, 157), "\n".join(lines[:2]), font=title_font, fill=(244, 249, 250), spacing=5)
+
+          left, gap, card_w, card_y, card_h = 44, 24, 267, 335, 220
+          for index, (number, label, desc) in enumerate(steps):
+              x = left + index * (card_w + gap)
+              draw.rounded_rectangle((x, card_y, x + card_w, card_y + card_h),
+                                     radius=20, fill=(13, 36, 48), outline=(27, 118, 112), width=2)
+              draw.rounded_rectangle((x + 18, card_y + 17, x + 68, card_y + 65),
+                                     radius=14, fill=(19, 94, 87))
+              draw.text((x + 27, card_y + 27), number, font=font(20, True), fill=(94, 246, 195))
+              draw.text((x + 18, card_y + 82), label, font=font(22, True), fill=(247, 250, 250))
+              # Wrap descriptions to the card width.
+              desc_words, desc_lines, desc_current = desc.split(), [], ""
+              desc_font = font(17)
+              for word in desc_words:
+                  trial = f"{desc_current} {word}".strip()
+                  if draw.textlength(trial, font=desc_font) <= card_w - 36:
+                      desc_current = trial
+                  else:
+                      if desc_current:
+                          desc_lines.append(desc_current)
+                      desc_current = word
+              if desc_current:
+                  desc_lines.append(desc_current)
+              draw.multiline_text((x + 18, card_y + 126), "\n".join(desc_lines[:3]),
+                                  font=desc_font, fill=(174, 202, 207), spacing=7)
+              if index < 3:
+                  ax = x + card_w + 4
+                  ay = card_y + 110
+                  draw.line((ax, ay, ax + gap - 8, ay), fill=(43, 225, 180), width=4)
+                  draw.polygon([(ax + gap - 13, ay - 7), (ax + gap - 3, ay), (ax + gap - 13, ay + 7)],
+                               fill=(43, 225, 180))
+
+          draw.rounded_rectangle((44, 588, 1156, 640), radius=15, fill=(10, 31, 41), outline=(19, 81, 79), width=1)
+          draw.ellipse((64, 606, 80, 622), fill=(52, 230, 177))
+          draw.text((94, 601), "ОБНОВЛЕНИЕ ANFISA", font=font(17, True), fill=(224, 243, 243))
+          draw.text((830, 603), "СХЕМА РАБОТЫ ФУНКЦИИ", font=font(15, True), fill=(95, 178, 180))
+
+          image_buffer = io.BytesIO()
+          image.save(image_buffer, format="PNG", optimize=True)
+          photo_bytes = image_buffer.getvalue()
+
+          caption = (
+              "📣 Anfisa | CHAT-MANAGER\n\n"
+              "✨ Новое обновление!\n"
               f"📰 {title}\n\n"
-              f"{' '.join(footer_icons)} Мы продолжаем улучшать бота и добавлять полезные функции. Следите за новостями!"
+              "На изображении — схема работы функции."
           )
-
-          # Make a normalized copy while keeping each character's original position.
-          normalized_chars, source_positions = [], []
-          for index, char in enumerate(text):
-              if char in ("\ufe0e", "\ufe0f"):
-                  continue
-              normalized_chars.append(char)
-              source_positions.append(index)
-          normalized_text = "".join(normalized_chars)
-
-          # Replace every matching fallback emoji with its premium custom emoji entity.
-          entities, occupied, converted = [], [], []
-          for key, (fallback, custom_id) in sorted(emoji_map.items(), key=lambda item: len(item[0]), reverse=True):
-              start = 0
-              while True:
-                  pos = normalized_text.find(key, start)
-                  if pos < 0:
-                      break
-                  end = pos + len(key)
-                  original_start = source_positions[pos]
-                  original_end = source_positions[end - 1] + 1
-                  while original_end < len(text) and text[original_end] in ("\ufe0e", "\ufe0f"):
-                      original_end += 1
-                  if any(not (original_end <= a or original_start >= b) for a, b in occupied):
-                      start = end
-                      continue
-                  entities.append({
-                      "type": "custom_emoji",
-                      "offset": len(text[:original_start].encode("utf-16-le")) // 2,
-                      "length": len(text[original_start:original_end].encode("utf-16-le")) // 2,
-                      "custom_emoji_id": custom_id
-                  })
-                  occupied.append((original_start, original_end))
-                  converted.append(fallback)
-                  start = end
-
-          entities.sort(key=lambda entity: entity["offset"])
-          call("sendMessage", {
+          message = call_multipart("sendPhoto", {
               "chat_id": channel,
-              "text": text,
-              "entities": entities,
-              "link_preview_options": {"is_disabled": True}
-          })
-          print(f"Announcement sent; premium emoji entities: {len(entities)}; unique fallbacks: {', '.join(dict.fromkeys(converted)) or 'none'}")
+              "caption": caption
+          }, photo_bytes)
+          print(f"Announcement with generated feature diagram sent; message_id={message.get('message_id')}; image_bytes={len(photo_bytes)}")
           PY
