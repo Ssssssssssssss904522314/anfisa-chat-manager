@@ -16,7 +16,7 @@ if (!TOKEN) {
 
 const API = `https://api.telegram.org/bot${TOKEN}`;
 const DATA_FILE = path.resolve(process.env.DATA_FILE || "./data.json");
-const MAX_WARNS = 3;
+const DEFAULT_WARN_LIMIT = 3;
 const SERVICE_CHAT_ID = process.env.SERVICE_CHAT_ID || "";
 const BOT_OWNER_ID = String(process.env.BOT_OWNER_ID || "").trim();
 const HELPER_USER_IDS = new Set((process.env.HELPER_USER_IDS || "").split(",").map((v) => v.trim()).filter(Boolean));
@@ -43,6 +43,8 @@ const aliases = {
   grant: new Set(["начислить", ".начислить"]),
   profile: new Set(["профиль", ".профиль"]),
   promote: new Set(["повысить", ".повысить"]),
+  warnLimit: new Set(["+варнлимит", "варнлимит", ".варнлимит"]),
+  summon: new Set([".позвать", "позвать"]),
 };
 
 async function loadState() {
@@ -56,9 +58,10 @@ async function loadState() {
     if (typeof state.botOwnerId !== "string") state.botOwnerId = "";
     if (!state.activity || typeof state.activity !== "object") state.activity = {};
     if (!state.levels || typeof state.levels !== "object") state.levels = {};
+    if (!state.warnLimits || typeof state.warnLimits !== "object") state.warnLimits = {};
   } catch (error) {
     if (error.code !== "ENOENT") console.error("Could not load data.json:", error);
-    state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [], botOwnerId: "", activity: {}, levels: {} };
+    state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [], botOwnerId: "", activity: {}, levels: {}, warnLimits: {} };
   }
 }
 
@@ -120,6 +123,10 @@ function countActivity(chatId, userId, periodMs) {
   if (!Array.isArray(events)) return 0;
   const since = Date.now() - periodMs;
   return events.filter((t) => Number(t) >= since).length;
+}
+function warnLimit(chatId) {
+  const value = Number(state.warnLimits?.[String(chatId)] || DEFAULT_WARN_LIMIT);
+  return Number.isInteger(value) && value >= 1 && value <= 100 ? value : DEFAULT_WARN_LIMIT;
 }
 function levelLabel(level) {
   return ({1:"Уровень 1 — участник",2:"Уровень 2 — мут и варн",3:"Уровень 3 — бан"})[level] || "Уровень 1 — участник";
@@ -482,6 +489,19 @@ async function handleUpdate(update) {
     await handleCoinPaymentUpdate(update);
     if (update.pre_checkout_query) return;
   }
+  if (update.my_chat_member) {
+    const change = update.my_chat_member;
+    const chat = change.chat;
+    const oldStatus = change.old_chat_member?.status;
+    const newStatus = change.new_chat_member?.status;
+    if (["member", "administrator"].includes(newStatus) && !["member", "administrator"].includes(oldStatus) && ["group", "supergroup"].includes(chat?.type)) {
+      try {
+        await send(chat.id,
+          "👋 Спасибо, что добавили Anfisa | CHAT-MANAGER!\\n\\nДля работы модерации выдайте боту права администратора: включите все доступные права, кроме «Оставаться анонимным». Особенно важны права банить участников и ограничивать участников.\\n\\nПосле выдачи прав проверьте команды .профиль и .варны.");
+      } catch (error) { console.error("Could not send add-to-chat notice:", error.message); }
+    }
+    return;
+  }
   const message = update.message;
   if (!message?.chat || !message.from || typeof message.text !== "string") return;
 
@@ -532,6 +552,50 @@ async function handleUpdate(update) {
     ].join("\n");
     await saveState();
     await send(chat.id, activityText, message.message_id);
+    return;
+  }
+
+  if (parsed.action === "warnLimit") {
+    let authorized = false;
+    try { authorized = await isAdmin(chat.id, sender.id); } catch {}
+    if (!authorized) {
+      await send(chat.id, "⛔ Менять лимит варнов могут только администраторы группы.", message.message_id);
+      return;
+    }
+    const match = /^([1-9]|[1-9][0-9]|100)$/.exec(parsed.reason);
+    if (!match) {
+      await send(chat.id, "Укажите лимит от 1 до 100. Например: +варнлимит 5", message.message_id);
+      return;
+    }
+    state.warnLimits[String(chat.id)] = Number(match[1]);
+    await saveState();
+    await send(chat.id, "✅ Лимит предупреждений установлен: " + match[1] + ". После достижения лимита участник будет забанен.", message.message_id);
+    return;
+  }
+
+  if (parsed.action === "summon") {
+    let authorized = false;
+    try { authorized = await isAdmin(chat.id, sender.id) || userLevel(chat.id, sender.id) >= 2; } catch {}
+    if (!authorized) {
+      await send(chat.id, "⛔ Позвать модераторов могут только администраторы и модераторы уровня 2/3.", message.message_id);
+      return;
+    }
+    const title = message.chat.title || "Группа";
+    let invite = message.chat.username ? "https://t.me/" + message.chat.username : "";
+    if (!invite) {
+      try { invite = await api("exportChatInviteLink", { chat_id: chat.id }); } catch {}
+    }
+    const details = "🆘 Вызов модератора Anfisa\\nЧат: " + title + "\\nID: " + chat.id +
+      (invite ? "\\nСсылка для входа: " + invite : "\\nСсылку не удалось создать — откройте чат по ID: " + chat.id) +
+      "\\nКто позвал: " + displayName(sender) + "\\nПожалуйста, присоединитесь и помогите разобраться.";
+    let sent = 0;
+    for (const id of HELPER_USER_IDS) {
+      try { await send(id, details); sent++; }
+      catch (error) { console.error("Could not DM helper " + id + ":", error.message); }
+    }
+    await send(chat.id, sent
+      ? "📣 Модераторы оповещены (" + sent + "). Они получат сообщение от Anfisa в личные сообщения. Если они ещё не запускали бота, им нужно открыть его и нажать /start."
+      : "⚠️ Не удалось отправить личные сообщения модераторам. Проверьте HELPER_USER_IDS и убедитесь, что каждый модератор нажал /start у бота.", message.message_id);
     return;
   }
 
@@ -621,8 +685,9 @@ async function handleUpdate(update) {
   }
 
   if (parsed.action === "warns") {
+    const limit = warnLimit(chat.id);
     const count = state.warnings[keyFor(chat.id, target.id)] || 0;
-    await send(chat.id, `${displayName(target)}: ${count}/${MAX_WARNS} предупреждений.`, message.message_id);
+    await send(chat.id, `${displayName(target)}: ${count}/${limit} предупреждений.`, message.message_id);
     return;
   }
 
@@ -653,16 +718,16 @@ async function handleUpdate(update) {
         state.warnings[key] = count;
         await saveState();
 
-        if (count >= MAX_WARNS) {
+        if (count >= warnLimit(chat.id)) {
           await api("banChatMember", { chat_id: chat.id, user_id: target.id });
           delete state.warnings[key];
           await saveState();
           await send(chat.id,
-            `⛔ ${targetName} получил(а) ${MAX_WARNS}-е предупреждение и забанен(а).${reasonSuffix(reason)}`,
+            `⛔ ${targetName} достиг(ла) лимита в ${warnLimit(chat.id)} предупреждений и забанен(а).${reasonSuffix(reason)}`,
             message.message_id);
         } else {
           await send(chat.id,
-            `⚠️ Предупреждение ${count}/${MAX_WARNS} для ${targetName}.${reasonSuffix(reason)}`,
+            `⚠️ Предупреждение ${count}/${warnLimit(chat.id)} для ${targetName}.${reasonSuffix(reason)}`,
             message.message_id);
         }
         break;
@@ -732,7 +797,7 @@ async function main() {
       const updates = await api("getUpdates", {
         offset,
         timeout: 50,
-        allowed_updates: ["message", "pre_checkout_query"],
+        allowed_updates: ["message", "pre_checkout_query", "my_chat_member"],
       });
       for (const update of updates) {
         offset = update.update_id + 1;
