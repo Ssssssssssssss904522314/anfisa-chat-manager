@@ -45,6 +45,7 @@ const aliases = {
   promote: new Set(["повысить", ".повысить"]),
   warnLimit: new Set(["+варнлимит", "варнлимит", ".варнлимит"]),
   summon: new Set([".позвать", "позвать"]),
+  emojiTest: new Set([".эмодзитест", "эмодзитест"]),
 };
 
 async function loadState() {
@@ -484,6 +485,42 @@ async function handleCoinCommand(message, parsed) {
   return true;
 }
 
+async function handleEmojiTest(message) {
+  const senderId = String(message.from?.id || "");
+  const ownerId = BOT_OWNER_ID || String(state.botOwnerId || "");
+  if (!ownerId || senderId !== ownerId) {
+    await send(message.chat.id, ownerId
+      ? "⛔ Тест премиум-эмодзи доступен только владельцу бота."
+      : "⚙️ Не задан BOT_OWNER_ID. Укажи свой Telegram ID в переменных окружения хостинга, затем перезапусти бота.");
+    return true;
+  }
+
+  try {
+    const pack = await api("getStickerSet", { name: "NewsEmoji" });
+    const sticker = (pack.stickers || []).find((item) => item.emoji && item.custom_emoji_id);
+    if (!sticker) {
+      await send(message.chat.id, "Не удалось найти в наборе NewsEmoji эмодзи с custom_emoji_id. Проверь название набора.");
+      return true;
+    }
+    const emoji = sticker.emoji;
+    await api("sendMessage", {
+      chat_id: message.chat.id,
+      text: emoji + " Тест премиум-эмодзи Anfisa",
+      entities: [{
+        type: "custom_emoji",
+        offset: 0,
+        length: emoji.length,
+        custom_emoji_id: sticker.custom_emoji_id
+      }],
+      link_preview_options: { is_disabled: true }
+    });
+  } catch (error) {
+    console.error("Premium emoji test failed:", error.message);
+    await send(message.chat.id, "❌ Тест не прошёл. Telegram ответил: " + error.message);
+  }
+  return true;
+}
+
 async function handleUpdate(update) {
   if (update.pre_checkout_query || update.message?.successful_payment) {
     await handleCoinPaymentUpdate(update);
@@ -509,6 +546,7 @@ async function handleUpdate(update) {
   const sender = message.from;
   const parsed = parseCommand(message.text);
   if (chat.type === "private") {
+    if (parsed?.action === "emojiTest") { await handleEmojiTest(message); return; }
     if (parsed && ["buy", "transfer", "service", "balance", "grant"].includes(parsed.action)) await handleCoinCommand(message, parsed);
     else if (parsed?.action === "help") await send(chat.id, "Anfisa | CHAT-MANAGER\n\n.покупка 10 — купить Анфисокоины за ⭐\n.баланс — баланс\n.передать количество — ответом на сообщение\n.услуга — платные услуги.", message.message_id);
     return;
