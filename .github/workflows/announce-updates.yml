@@ -22,7 +22,7 @@ jobs:
   announce:
     runs-on: ubuntu-latest
     steps:
-      - name: Publish update to Telegram channel
+      - name: Publish update with relevant premium emoji
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           UPDATE_CHANNEL_ID: ${{ secrets.UPDATE_CHANNEL_ID }}
@@ -30,17 +30,65 @@ jobs:
           MANUAL_TITLE: ${{ inputs.title }}
         run: |
           set -euo pipefail
-          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-            echo "::error::Add TELEGRAM_BOT_TOKEN in repository Actions secrets."
-            exit 1
-          fi
-          if [ -z "${UPDATE_CHANNEL_ID:-}" ]; then
-            echo "::error::Add UPDATE_CHANNEL_ID in repository Actions secrets."
-            exit 1
-          fi
-          TITLE="${MANUAL_TITLE:-Новое улучшение бота}"
-          TITLE="$(printf '%s' "$TITLE" | head -n 1)"
-          TEXT=$(printf '✨ <b>Anfisa | CHAT-MANAGER</b>\n\n🚀 <b>Новое обновление!</b>\n%s\n\n🛡️ Мы продолжаем улучшать бота и добавлять полезные функции. Следите за новостями!' "$TITLE")
-          curl --fail --silent --show-error "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -H 'Content-Type: application/json' \
-            --data "$(jq -n --arg chat_id "$UPDATE_CHANNEL_ID" --arg text "$TEXT" '{chat_id:$chat_id,text:$text,parse_mode:"HTML",link_preview_options:{is_disabled:true}}')"
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          channel = os.environ.get("UPDATE_CHANNEL_ID", "")
+          if not token or not channel:
+              raise SystemExit("Set TELEGRAM_BOT_TOKEN and UPDATE_CHANNEL_ID in repository Actions secrets.")
+
+          api = f"https://api.telegram.org/bot{token}/"
+          def call(method, payload=None):
+              data = json.dumps(payload or {}).encode()
+              req = urllib.request.Request(api + method, data=data, headers={"Content-Type":"application/json"})
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  result = json.load(response)
+              if not result.get("ok"):
+                  raise RuntimeError(f"Telegram {method} failed: {result}")
+              return result["result"]
+
+          title = (os.environ.get("MANUAL_TITLE") or "Новое улучшение бота").splitlines()[0]
+          text = (
+              "Anfisa | CHAT-MANAGER\n\n"
+              "Новое обновление!\n"
+              f"{title}\n\n"
+              "Мы продолжаем улучшать бота и добавлять полезные функции. Следите за новостями!"
+          )
+
+          # Read the emoji-to-custom-ID mapping directly from the NewsEmoji pack.
+          pack = call("getStickerSet", {"name":"NewsEmoji"})
+          emoji_map = {}
+          for sticker in pack.get("stickers", []):
+              emoji = sticker.get("emoji")
+              custom_id = sticker.get("custom_emoji_id")
+              if emoji and custom_id:
+                  emoji_map.setdefault(emoji, custom_id)
+
+          # Use custom emoji entities only where a pack emoji fits the announcement text.
+          # UTF-16 offsets are required by Telegram's Bot API.
+          entities = []
+          used = set()
+          for emoji, custom_id in sorted(emoji_map.items(), key=lambda item: len(item[0]), reverse=True):
+              start = 0
+              while emoji and emoji in text[start:]:
+                  pos = text.find(emoji, start)
+                  if pos < 0:
+                      break
+                  if any(not (pos + len(emoji) <= a or pos >= b) for a, b in used):
+                      start = pos + len(emoji)
+                      continue
+                  offset = len(text[:pos].encode("utf-16-le")) // 2
+                  length = len(emoji.encode("utf-16-le")) // 2
+                  entities.append({"type":"custom_emoji","offset":offset,"length":length,"custom_emoji_id":custom_id})
+                  used.add((pos, pos + len(emoji)))
+                  start = pos + len(emoji)
+
+          call("sendMessage", {
+              "chat_id": channel,
+              "text": text,
+              "entities": entities,
+              "link_preview_options": {"is_disabled": True}
+          })
+          print(f"Announcement sent. Premium emoji entities used: {len(entities)}")
+          PY
