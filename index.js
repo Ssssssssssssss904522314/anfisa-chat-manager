@@ -609,7 +609,7 @@ async function handleUpdate(update) {
     if (parsed?.action === "emojiTest") { await handleEmojiTest(message); return; }
     if (parsed?.action === "emojiChannelTest") { await handleChannelEmojiTest(message); return; }
     if (parsed && ["buy", "transfer", "service", "balance", "grant"].includes(parsed.action)) await handleCoinCommand(message, parsed);
-    else if (parsed?.action === "help") await send(chat.id, "Anfisa | CHAT-MANAGER\n\n.покупка 10 — купить Анфисокоины за ⭐\n.баланс — баланс\n.передать количество — ответом на сообщение\n.услуга — платные услуги.", message.message_id);
+    else if (parsed?.action === "help") await send(chat.id, "Anfisa | CHAT-MANAGER\n\n.покупка 10 — купить Анфисокоины за ⭐\n.баланс — баланс\n.передать количество — ответом на сообщение\n.услуга — платные услуги.\n.тестэмодзиканал — отправить тест премиум-эмодзи в канал (только владелец).", message.message_id);
     return;
   }
   if (chat.type !== "group" && chat.type !== "supergroup") return;
