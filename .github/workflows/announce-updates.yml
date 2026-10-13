@@ -1,0 +1,49 @@
+name: Automatic bot update announcements
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'index.js'
+      - 'package.json'
+      - '.github/workflows/announce-updates.yml'
+  workflow_dispatch:
+    inputs:
+      title:
+        description: 'Название обновления (для ручного теста)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish update to Telegram channel
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          UPDATE_CHANNEL_ID: ${{ secrets.UPDATE_CHANNEL_ID }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          MANUAL_TITLE: ${{ inputs.title }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo "::error::Add TELEGRAM_BOT_TOKEN in repository Actions secrets."
+            exit 1
+          fi
+          if [ -z "${UPDATE_CHANNEL_ID:-}" ]; then
+            echo "::error::Add UPDATE_CHANNEL_ID in repository Actions secrets (for example @anfisa_kanal_bot)."
+            exit 1
+          fi
+          TITLE="${MANUAL_TITLE:-${COMMIT_MESSAGE:-Новое обновление Anfisa}}"
+          TITLE="$(printf '%s' "$TITLE" | head -n 1)"
+          URL="${COMMIT_URL:-https://github.com/${REPOSITORY}/commits/main}"
+          TEXT=$(printf '✨ <b>Anfisa | CHAT-MANAGER — обновление!</b>\n\n🚀 <b>%s</b>\n\n🛡️ Следите за новыми возможностями и улучшениями бота.\n\n📦 <a href="%s">Посмотреть изменения</a>' "$TITLE" "$URL")
+          curl --fail --silent --show-error "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H 'Content-Type: application/json' \
+            --data "$(jq -n --arg chat_id "$UPDATE_CHANNEL_ID" --arg text "$TEXT" '{chat_id:$chat_id,text:$text,parse_mode:"HTML",link_preview_options:{is_disabled:true}}')"
