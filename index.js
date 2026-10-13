@@ -51,9 +51,10 @@ async function loadState() {
     if (!state.helperLastSeen || typeof state.helperLastSeen !== "object") state.helperLastSeen = {};
     if (!state.balances || typeof state.balances !== "object") state.balances = {};
     if (!Array.isArray(state.processedPayments)) state.processedPayments = [];
+    if (typeof state.botOwnerId !== "string") state.botOwnerId = "";
   } catch (error) {
     if (error.code !== "ENOENT") console.error("Could not load data.json:", error);
-    state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [] };
+    state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [], botOwnerId: "" };
   }
 }
 
@@ -270,8 +271,26 @@ async function handleCoinCommand(message, parsed) {
   const parts = args.split(/\s+/).filter(Boolean);
 
   if (parsed.action === "grant") {
-    if (!BOT_OWNER_ID || String(sender.id) !== BOT_OWNER_ID) {
-      await send(chatId, "⛔ Начислять Анфисокоины может только владелец бота.", message.message_id);
+    // If BOT_OWNER_ID was not configured in hosting, let the creator of a group
+    // claim ownership once by using this command there. Store the ID in data.json.
+    let ownerId = BOT_OWNER_ID || String(state.botOwnerId || "");
+    if (!ownerId && ["group", "supergroup"].includes(message.chat.type)) {
+      try {
+        const member = await api("getChatMember", { chat_id: chatId, user_id: sender.id });
+        if (member.status === "creator") {
+          ownerId = String(sender.id);
+          state.botOwnerId = ownerId;
+          await saveState();
+        }
+      } catch (error) {
+        console.error("Could not bootstrap bot owner:", error.message);
+      }
+    }
+    if (!ownerId || String(sender.id) !== ownerId) {
+      await send(chatId, ownerId
+        ? "⛔ Начислять Анфисокоины может только владелец бота."
+        : "⚙️ Владелец ещё не настроен. Напишите эту команду в группе, где вы создатель, ответом на сообщение пользователя: .начислить 100. Бот запомнит ваш ID как владельца. После этого можно начислять и в ЛС.",
+        message.message_id);
       return true;
     }
     const target = message.reply_to_message?.from;
