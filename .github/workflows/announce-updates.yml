@@ -30,7 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, urllib.request
+          import json, os, re, urllib.request
 
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
           channel = os.environ.get("UPDATE_CHANNEL_ID", "")
@@ -39,55 +39,124 @@ jobs:
 
           api = f"https://api.telegram.org/bot{token}/"
           def call(method, payload=None):
-              req = urllib.request.Request(api + method, data=json.dumps(payload or {}).encode(), headers={"Content-Type":"application/json"})
+              req = urllib.request.Request(
+                  api + method,
+                  data=json.dumps(payload or {}).encode(),
+                  headers={"Content-Type": "application/json"}
+              )
               with urllib.request.urlopen(req, timeout=20) as response:
                   result = json.load(response)
               if not result.get("ok"):
                   raise RuntimeError(f"Telegram {method} failed: {result}")
               return result["result"]
 
-          title = (os.environ.get("MANUAL_TITLE") or "Новое улучшение бота").splitlines()[0]
-          text = (
-              "✨ Anfisa | CHAT-MANAGER\n\n"
-              "🚀 Новое обновление!\n"
-              f"📰 {title}\n\n"
-              "🛡️ Мы продолжаем улучшать бота и добавлять полезные функции. Следите за новостями!"
-          )
+          def normalize(value):
+              # Ignore optional Unicode variation selectors while matching fallback emoji.
+              return value.replace("\ufe0f", "").replace("\ufe0e", "")
 
-          # Read custom emoji IDs from the NewsEmoji pack.
-          pack = call("getStickerSet", {"name":"NewsEmoji"})
+          title = (os.environ.get("MANUAL_TITLE") or "").strip()
+          if not title:
+              try:
+                  with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+                      event = json.load(event_file)
+                  title = (event.get("head_commit") or {}).get("message", "").splitlines()[0].strip()
+              except (OSError, ValueError, KeyError, IndexError):
+                  title = ""
+          title = re.sub(r"^(feat|feature|fix|bugfix|chore|docs|refactor|style|test)(\([^)]*\))?:\s*", "", title, flags=re.IGNORECASE).strip()
+          if not title or title.lower() in {"update index.js", "update package.json", "update announce-updates.yml"}:
+              title = "Новое улучшение бота"
+
+          # Read the emoji-to-custom-ID mapping from the public NewsEmoji pack.
+          pack = call("getStickerSet", {"name": "NewsEmoji"})
           emoji_map = {}
           for sticker in pack.get("stickers", []):
-              emoji, custom_id = sticker.get("emoji"), sticker.get("custom_emoji_id")
-              if emoji and custom_id:
-                  emoji_map.setdefault(emoji, custom_id)
+              fallback, custom_id = sticker.get("emoji"), sticker.get("custom_emoji_id")
+              if fallback and custom_id:
+                  emoji_map.setdefault(normalize(fallback), (fallback, custom_id))
 
-          # Replace matching emoji visually with premium custom emoji entities.
-          entities, occupied = [], []
-          for emoji, custom_id in sorted(emoji_map.items(), key=lambda item: len(item[0]), reverse=True):
+          used_keys = set()
+          def choose(candidates, limit):
+              selected = []
+              for candidate in candidates:
+                  key = normalize(candidate)
+                  if key in emoji_map and key not in used_keys:
+                      selected.append(emoji_map[key][0])
+                      used_keys.add(key)
+                      if len(selected) >= limit:
+                          break
+              return selected
+
+          title_lower = title.casefold()
+          security_terms = ("безопас", "защит", "модерац", "бан", "варн", "мут", "спам", "security", "moderation", "ban", "spam")
+          payment_terms = ("оплат", "звезд", "stars", "коин", "coin", "покуп", "платеж", "баланс", "эконом")
+          fix_terms = ("исправ", "ошиб", "баг", "фикс", "fix", "bug", "почин")
+
+          if any(term in title_lower for term in security_terms):
+              topic_candidates = ["🛡️", "🔒", "⛔️", "🚫", "❗️", "👀", "⚡️"]
+          elif any(term in title_lower for term in payment_terms):
+              topic_candidates = ["🛍", "💳", "💰", "🪙", "⭐", "💎", "⚡️"]
+          elif any(term in title_lower for term in fix_terms):
+              topic_candidates = ["✅", "🔧", "🛠️", "⚙️", "🩹", "⚡️", "❗️"]
+          else:
+              topic_candidates = ["🚀", "✨", "⚡️", "☄️", "💡", "🆕", "🎉"]
+
+          header_icons = choose(["📰", "📣", "🔔", "👀", "❗️"], 2)
+          topic_icons = choose(topic_candidates, 3)
+          footer_icons = choose(["🔔", "🙂", "👋", "💬", "👀"], 1)
+
+          if not header_icons:
+              header_icons = ["📣"]
+          if not topic_icons:
+              topic_icons = ["🚀"]
+          if not footer_icons:
+              footer_icons = ["🔔"]
+
+          text = (
+              f"{' '.join(header_icons)} Anfisa | CHAT-MANAGER\n\n"
+              f"{' '.join(topic_icons)} Новое обновление!\n"
+              f"📰 {title}\n\n"
+              f"{' '.join(footer_icons)} Мы продолжаем улучшать бота и добавлять полезные функции. Следите за новостями!"
+          )
+
+          # Make a normalized copy while keeping each character's original position.
+          normalized_chars, source_positions = [], []
+          for index, char in enumerate(text):
+              if char in ("\ufe0e", "\ufe0f"):
+                  continue
+              normalized_chars.append(char)
+              source_positions.append(index)
+          normalized_text = "".join(normalized_chars)
+
+          # Replace every matching fallback emoji with its premium custom emoji entity.
+          entities, occupied, converted = [], [], []
+          for key, (fallback, custom_id) in sorted(emoji_map.items(), key=lambda item: len(item[0]), reverse=True):
               start = 0
               while True:
-                  pos = text.find(emoji, start)
+                  pos = normalized_text.find(key, start)
                   if pos < 0:
                       break
-                  end = pos + len(emoji)
-                  if any(not (end <= a or pos >= b) for a, b in occupied):
+                  end = pos + len(key)
+                  original_start = source_positions[pos]
+                  original_end = source_positions[end - 1] + 1
+                  if any(not (original_end <= a or original_start >= b) for a, b in occupied):
                       start = end
                       continue
                   entities.append({
                       "type": "custom_emoji",
-                      "offset": len(text[:pos].encode("utf-16-le")) // 2,
-                      "length": len(emoji.encode("utf-16-le")) // 2,
+                      "offset": len(text[:original_start].encode("utf-16-le")) // 2,
+                      "length": len(text[original_start:original_end].encode("utf-16-le")) // 2,
                       "custom_emoji_id": custom_id
                   })
-                  occupied.append((pos, end))
+                  occupied.append((original_start, original_end))
+                  converted.append(fallback)
                   start = end
 
+          entities.sort(key=lambda entity: entity["offset"])
           call("sendMessage", {
               "chat_id": channel,
               "text": text,
               "entities": entities,
               "link_preview_options": {"is_disabled": True}
           })
-          print(f"Announcement sent; matching premium emoji: {len(entities)}")
+          print(f"Announcement sent; premium emoji entities: {len(entities)}; unique fallbacks: {', '.join(dict.fromkeys(converted)) or 'none'}")
           PY
