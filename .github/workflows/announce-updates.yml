@@ -138,7 +138,7 @@ jobs:
                   end = pos + len(key)
                   original_start = source_positions[pos]
                   original_end = source_positions[end - 1] + 1
-                  while original_end < len(text) and text[original_end] in ("\\ufe0e", "\\ufe0f"):
+                  while original_end < len(text) and text[original_end] in ("\ufe0e", "\ufe0f"):
                       original_end += 1
                   if any(not (original_end <= a or original_start >= b) for a, b in occupied):
                       start = end
