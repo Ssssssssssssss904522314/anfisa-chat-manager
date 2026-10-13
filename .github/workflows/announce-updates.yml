@@ -27,9 +27,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           UPDATE_CHANNEL_ID: ${{ secrets.UPDATE_CHANNEL_ID }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-          COMMIT_URL: ${{ github.event.head_commit.url }}
           MANUAL_TITLE: ${{ inputs.title }}
-          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
@@ -37,13 +35,12 @@ jobs:
             exit 1
           fi
           if [ -z "${UPDATE_CHANNEL_ID:-}" ]; then
-            echo "::error::Add UPDATE_CHANNEL_ID in repository Actions secrets (for example @anfisa_kanal_bot)."
+            echo "::error::Add UPDATE_CHANNEL_ID in repository Actions secrets."
             exit 1
           fi
-          TITLE="${MANUAL_TITLE:-${COMMIT_MESSAGE:-Новое обновление Anfisa}}"
+          TITLE="${MANUAL_TITLE:-Новое улучшение бота}"
           TITLE="$(printf '%s' "$TITLE" | head -n 1)"
-          URL="${COMMIT_URL:-https://github.com/${REPOSITORY}/commits/main}"
-          TEXT=$(printf '✨ <b>Anfisa | CHAT-MANAGER — обновление!</b>\n\n🚀 <b>%s</b>\n\n🛡️ Следите за новыми возможностями и улучшениями бота.\n\n📦 <a href="%s">Посмотреть изменения</a>' "$TITLE" "$URL")
+          TEXT=$(printf '✨ <b>Anfisa | CHAT-MANAGER</b>\n\n🚀 <b>Новое обновление!</b>\n%s\n\n🛡️ Мы продолжаем улучшать бота и добавлять полезные функции. Следите за новостями!' "$TITLE")
           curl --fail --silent --show-error "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -H 'Content-Type: application/json' \
             --data "$(jq -n --arg chat_id "$UPDATE_CHANNEL_ID" --arg text "$TEXT" '{chat_id:$chat_id,text:$text,parse_mode:"HTML",link_preview_options:{is_disabled:true}}')"
