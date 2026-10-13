@@ -542,13 +542,13 @@ async function handleChannelEmojiTest(message) {
       return true;
     }
 
-    let text = "🧪 Тест премиум-эмодзи Anfisa | CHAT-MANAGER\\n\\n";
+    let text = "🧪 Тест премиум-эмодзи Anfisa | CHAT-MANAGER\n\n";
     const entities = [];
     const maxTextLength = 4000;
     let sentCount = 0;
 
     for (const sticker of stickers) {
-      const separator = sentCount === 0 ? "" : (sentCount % 8 === 0 ? "\\n" : " ");
+      const separator = sentCount === 0 ? "" : (sentCount % 8 === 0 ? "\n" : " ");
       const emoji = sticker.emoji;
       if (text.length + separator.length + emoji.length > maxTextLength) break;
 
@@ -564,7 +564,7 @@ async function handleChannelEmojiTest(message) {
       sentCount++;
     }
 
-    text += "\\n\\nВсего в тесте: " + sentCount + " премиум-эмодзи из набора NewsEmoji.";
+    text += "\n\nВсего в тесте: " + sentCount + " премиум-эмодзи из набора NewsEmoji.";
     await api("sendMessage", {
       chat_id: UPDATE_CHANNEL_ID,
       text,
@@ -572,11 +572,11 @@ async function handleChannelEmojiTest(message) {
       link_preview_options: { is_disabled: true }
     });
     await send(message.chat.id,
-      "✅ Тестовая публикация отправлена в канал.\\nПроверено премиум-эмодзи: " + sentCount + ".\\nЕсли эмодзи не отображаются, убедись, что Anfisa может публиковать сообщения в канале.");
+      "✅ Тестовая публикация отправлена в канал.\nПроверено премиум-эмодзи: " + sentCount + ".\nЕсли эмодзи не отображаются, убедись, что Anfisa может публиковать сообщения в канале.");
   } catch (error) {
     console.error("Channel premium emoji test failed:", error.message);
     await send(message.chat.id,
-      "❌ Не удалось отправить тест в канал. Проверь, что Anfisa добавлена администратором канала и может публиковать сообщения.\\nДетали: " + error.message);
+      "❌ Не удалось отправить тест в канал. Проверь, что Anfisa добавлена администратором канала и может публиковать сообщения.\nДетали: " + error.message);
   }
   return true;
 }
