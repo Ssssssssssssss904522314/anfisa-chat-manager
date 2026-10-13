@@ -7,7 +7,6 @@ on:
     paths:
       - 'index.js'
       - 'package.json'
-      - '.github/workflows/announce-updates.yml'
   workflow_dispatch:
     inputs:
       title:
@@ -65,6 +64,22 @@ jobs:
           title = re.sub(r"^(feat|feature|fix|bugfix|chore|docs|refactor|style|test)(\([^)]*\))?:\s*", "", title, flags=re.IGNORECASE).strip()
           if not title or title.lower() in {"update index.js", "update package.json", "update announce-updates.yml"}:
               title = "Новое улучшение бота"
+
+          # Keep auto-generated announcement titles in Russian when commit messages are English.
+          if not re.search(r"[а-яё]", title, flags=re.IGNORECASE):
+              original_title = title.casefold()
+              if any(word in original_title for word in ("emoji", "announcement", "workflow", "premium")):
+                  title = "Улучшен подбор премиум-эмодзи и публикация обновлений"
+              elif any(word in original_title for word in ("security", "moderation", "ban", "spam", "warn", "mute")):
+                  title = "Улучшены инструменты модерации и безопасности"
+              elif any(word in original_title for word in ("payment", "coin", "stars", "purchase", "balance")):
+                  title = "Обновлены покупки и Анфисокоины"
+              elif any(word in original_title for word in ("fix", "bug", "error")):
+                  title = "Исправлены ошибки бота"
+              elif any(word in original_title for word in ("feat", "feature", "add", "implement", "new")):
+                  title = "Добавлена новая функция"
+              else:
+                  title = "Новое улучшение бота"
 
           # Read the emoji-to-custom-ID mapping from the public NewsEmoji pack.
           pack = call("getStickerSet", {"name": "NewsEmoji"})
