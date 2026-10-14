@@ -183,13 +183,19 @@ function reasonSuffix(reason) {
 }
 
 function parseDurationInput(input = "") {
-  const match = /^(\d+)\s*(с|сек(?:унд(?:а|ы)?)?|м|мин(?:ут(?:а|ы)?)?|ч|час(?:а|ов)?|д|дн(?:я|ей)?|день)\s*(.*)$/i.exec(String(input).trim());
+  const match = /^(\d+)\s*(секунд(?:а|ы)?|сек|с|минут(?:а|ы)?|мин|м|час(?:а|ов)?|ч|дней|дня|дн|день|д)(?=\s|$)\s*(.*)$/i.exec(String(input).trim());
   if (!match) return { matched: false, reason: String(input).trim() };
   const amount = Number(match[1]), unit = match[2].toLowerCase();
   const multiplier = unit.startsWith("с") ? 1 : unit.startsWith("м") ? 60 : unit.startsWith("ч") ? 3600 : 86400;
   const durationSeconds = amount * multiplier;
   if (!Number.isSafeInteger(durationSeconds) || durationSeconds < 30 || durationSeconds > 366 * 86400) return { matched: true, invalid: true, durationSeconds, reason: match[3].trim() };
   return { matched: true, durationSeconds, reason: match[3].trim() };
+}
+function durationLabel(seconds) {
+  if (seconds % 86400 === 0) return (seconds / 86400) + " дн.";
+  if (seconds % 3600 === 0) return (seconds / 3600) + " ч.";
+  if (seconds % 60 === 0) return (seconds / 60) + " мин.";
+  return seconds + " сек.";
 }
 function chatSettings(chatId) {
   const s = state.chatSettings?.[String(chatId)] || {};
@@ -297,9 +303,6 @@ async function handleNewMembers(message) {
 async function runAntiSpam(message) {
   const chatId = String(message.chat.id);
   if (!chatSettings(chatId).antiSpam || message.from?.is_bot) return false;
-  let protectedMember = false;
-  try { protectedMember = await isProtected(chatId, message.from.id); } catch { protectedMember = true; }
-  if (protectedMember) return false;
   const text = String(message.text || message.caption || "").trim();
   const fingerprint = (text || (message.photo ? "[photo]" : message.sticker ? "[sticker]" : message.document ? "[document]" : "[media]")).toLowerCase().replace(/\s+/g, " ").slice(0, 600);
   const key = chatId + ":" + message.from.id, now = Date.now();
@@ -312,6 +315,9 @@ async function runAntiSpam(message) {
   if (text.length >= 4 && repeated.length >= 3) reasons.push("повторяющиеся сообщения");
   if (links.length >= 4) reasons.push("массовая отправка ссылок");
   if (!reasons.length) return false;
+  let protectedMember = false;
+  try { protectedMember = await isProtected(chatId, message.from.id); } catch { protectedMember = true; }
+  if (protectedMember) return false;
   let deleted = false;
   try { await api("deleteMessage", { chat_id: message.chat.id, message_id: message.message_id }); deleted = true; } catch (error) { console.error("Could not delete spam:", error.message); }
   const reason = reasons.join("; ");
@@ -506,7 +512,7 @@ async function handleServiceCommand(message, parsed) {
 }
 
 function escapeHtml(value = "") {
-  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/\'/g, "&#39;");
 }
 
 
@@ -1090,7 +1096,7 @@ async function handleUpdate(update) {
   }
   const reason = durationInput.matched ? durationInput.reason : parsed.reason;
   const untilDate = durationInput.matched ? Math.floor(Date.now() / 1000) + durationInput.durationSeconds : undefined;
-  const durationText = durationInput.matched ? " на " + Math.round(durationInput.durationSeconds / 60) + " мин." : "";
+  const durationText = durationInput.matched ? " на " + durationLabel(durationInput.durationSeconds) : "";
 
   try {
     switch (parsed.action) {
@@ -1140,7 +1146,7 @@ async function handleUpdate(update) {
           use_independent_chat_permissions: true,
           ...(untilDate ? { until_date: untilDate } : {}),
         });
-        await send(chat.id, `🔇 ${targetName} получил(а) мут${durationInput.matched ? " на " + Math.round(durationInput.durationSeconds / 60) + " мин." : " до снятия администратором"}.${reasonSuffix(reason)}`, message.message_id);
+        await send(chat.id, `🔇 ${targetName} получил(а) мут${durationInput.matched ? " на " + durationLabel(durationInput.durationSeconds) : " до снятия администратором"}.${reasonSuffix(reason)}`, message.message_id);
         await logModeration({ chatId: chat.id, action: "Мут" + durationText, actor: sender, target, reason });
         break;
       case "unmute":
