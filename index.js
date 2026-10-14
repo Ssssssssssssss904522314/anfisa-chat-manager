@@ -60,6 +60,10 @@ const aliases = {
   antiSpam: new Set([".антиспам", "антиспам"]),
   raid: new Set([".рейд", "рейд", ".рейдзащита", "рейдзащита"]),
   welcome: new Set([".приветствие", "приветствие"]),
+  shop: new Set([".магазин", "магазин"]),
+  buyBadge: new Set([".купитьзначок", "купитьзначок"]),
+  badge: new Set([".значок", "значок"]),
+  coinTop: new Set([".топкоинов", "топкоинов"]),
   emojiTest: new Set([".эмодзитест", "эмодзитест"]),
   emojiChannelTest: new Set([".тестэмодзиканал"]),
 };
@@ -82,6 +86,8 @@ async function loadState() {
   }
   if (!state.chatSettings || typeof state.chatSettings !== "object") state.chatSettings = {};
   if (!state.verifications || typeof state.verifications !== "object") state.verifications = {};
+  if (!state.profileBadges || typeof state.profileBadges !== "object") state.profileBadges = {};
+  if (!state.userNames || typeof state.userNames !== "object") state.userNames = {};
   if (!Array.isArray(state.moderationLog)) state.moderationLog = [];
   if (!Array.isArray(state.reports)) state.reports = [];
   if (!Array.isArray(state.appeals)) state.appeals = [];
@@ -542,6 +548,11 @@ function escapeHtml(value = "") {
 
 const COIN_PACKAGES = new Map([[10, 15], [15, 20], [20, 35], [35, 40]]);
 const SERVICE_PRICES = { разварн: 10, разбан: 15, размут: 19 };
+const COIN_BADGES = {
+  щит: { label: "Щит защитника", emoji: "🛡️", price: 15 },
+  звезда: { label: "Звезда сообщества", emoji: "⭐", price: 25 },
+  корона: { label: "Корона Анфисы", emoji: "👑", price: 50 },
+};
 const GRID_SERVICE_PRICE = 65;
 function coinBalance(id) { return Number(state.balances[String(id)] || 0); }
 function positiveInt(value) {
@@ -623,6 +634,35 @@ async function handleCoinCommand(message, parsed) {
     return true;
   }
 
+  if (parsed.action === "shop") {
+    await send(chatId, "🛍 Магазин Анфисокоинов\n\nщит — Щит защитника: 15 АК\nзвезда — Звезда сообщества: 25 АК\nкорона — Корона Анфисы: 50 АК\n\nПокупка: .купитьзначок щит\nТвои значки можно посмотреть командой .значок. Значки декоративные и не дают прав модерации.", message.message_id);
+    return true;
+  }
+  if (parsed.action === "buyBadge") {
+    const badgeKey = String(parts[0] || "").toLowerCase();
+    const badge = COIN_BADGES[badgeKey];
+    if (!badge) { await send(chatId, "Неизвестный значок. Открой .магазин и выбери: щит, звезда или корона.", message.message_id); return true; }
+    const owned = Array.isArray(state.profileBadges[String(sender.id)]) ? state.profileBadges[String(sender.id)] : [];
+    if (owned.includes(badgeKey)) { await send(chatId, "У тебя уже есть значок " + badge.emoji + " " + badge.label + ".", message.message_id); return true; }
+    if (coinBalance(sender.id) < badge.price) { await send(chatId, "Не хватает Анфисокоинов. Цена: " + badge.price + " АК; твой баланс: " + coinBalance(sender.id) + " АК.", message.message_id); return true; }
+    state.balances[String(sender.id)] = coinBalance(sender.id) - badge.price;
+    state.profileBadges[String(sender.id)] = [...owned, badgeKey];
+    await saveState();
+    await send(chatId, "✅ Куплен значок " + badge.emoji + " " + badge.label + " за " + badge.price + " АК. Остаток: " + coinBalance(sender.id) + " АК.", message.message_id);
+    return true;
+  }
+  if (parsed.action === "badge") {
+    const owned = Array.isArray(state.profileBadges[String(sender.id)]) ? state.profileBadges[String(sender.id)] : [];
+    const label = owned.length ? owned.map((key) => COIN_BADGES[key]?.emoji + " " + COIN_BADGES[key]?.label).join("\n") : "Пока нет значков. Загляни в .магазин.";
+    await send(chatId, "🎖 Значки " + displayName(sender) + "\n" + label, message.message_id);
+    return true;
+  }
+  if (parsed.action === "coinTop") {
+    const leaders = Object.entries(state.balances || {}).filter(([, balance]) => Number(balance) > 0).sort((a, b) => Number(b[1]) - Number(a[1])).slice(0, 10);
+    const text = leaders.length ? leaders.map(([id, balance], index) => (index + 1) + ". " + (state.userNames?.[id] || "Участник") + " — " + Number(balance) + " АК").join("\n") : "Рейтинг пока пуст.";
+    await send(chatId, "🏆 Топ Анфисокоинов\n" + text, message.message_id);
+    return true;
+  }
   if (parsed.action === "balance") {
     await send(chatId, "🪙 Баланс: " + coinBalance(sender.id) + " Анфисокоинов (АК).", message.message_id);
     return true;
@@ -912,13 +952,15 @@ async function handleUpdate(update) {
 
   const chat = message.chat;
   const sender = message.from;
+  if (!state.userNames || typeof state.userNames !== "object") state.userNames = {};
+  state.userNames[String(sender.id)] = displayName(sender);
   const parsed = parseCommand(messageText);
   if (chat.type === "private") {
     if (parsed?.action === "appeal") { await handleAppealCommand(message, parsed); return; }
     if (parsed?.action === "emojiTest") { await handleEmojiTest(message); return; }
     if (parsed?.action === "emojiChannelTest") { await handleChannelEmojiTest(message); return; }
-    if (parsed && ["buy", "transfer", "service", "balance", "grant"].includes(parsed.action)) await handleCoinCommand(message, parsed);
-    else if (parsed?.action === "help") await send(chat.id, "Anfisa | CHAT-MANAGER\n\n.покупка 10 — купить Анфисокоины за ⭐\n.баланс — баланс\n.передать количество — ответом на сообщение\n.услуга — платные услуги.\n.тестэмодзиканал — отправить тест премиум-эмодзи в канал (только владелец).", message.message_id);
+    if (parsed && ["buy", "transfer", "service", "balance", "grant", "shop", "buyBadge", "badge", "coinTop"].includes(parsed.action)) await handleCoinCommand(message, parsed);
+    else if (parsed?.action === "help") await send(chat.id, "Anfisa | CHAT-MANAGER\n\n.покупка 10 — купить Анфисокоины за ⭐\n.баланс — баланс\n.передать количество — ответом на сообщение\n.услуга — платные услуги\n.магазин — витрина значков\n.купитьзначок щит — купить декор\n.значок — мои значки\n.топкоинов — рейтинг балансов\n.апелляция CHAT_ID причина — обжаловать бан.\n.тестэмодзиканал — тест эмодзи в канал (только владелец).", message.message_id);
     return;
   }
   if (chat.type !== "group" && chat.type !== "supergroup") return;
@@ -946,7 +988,7 @@ async function handleUpdate(update) {
   if (!parsed) { await runAntiSpam(message); await saveState(); return; }
   if (parsed.action === "report") { await handleReportCommand(message, parsed); return; }
   if (["antiSpam", "raid", "welcome"].includes(parsed.action)) { await handleSettingsCommand(message, parsed); return; }
-  if (["buy", "transfer", "service", "balance", "grant"].includes(parsed.action)) { await handleCoinCommand(message, parsed); return; }
+  if (["buy", "transfer", "service", "balance", "grant", "shop", "buyBadge", "badge", "coinTop"].includes(parsed.action)) { await handleCoinCommand(message, parsed); return; }
 
   if (parsed.action === "stats") {
     let authorized = false;
@@ -978,7 +1020,8 @@ async function handleUpdate(update) {
       "Месяц: " + countActivity(chat.id, target.id, 30*24*60*60*1000) + " сообщ.",
       "Год: " + countActivity(chat.id, target.id, 365*24*60*60*1000) + " сообщ.",
       "Статус: " + role,
-      "Права Anfisa: " + levelLabel(level)
+      "Права Anfisa: " + levelLabel(level),
+      "Значки: " + ((Array.isArray(state.profileBadges?.[String(target.id)]) && state.profileBadges[String(target.id)].length) ? state.profileBadges[String(target.id)].map((key) => (COIN_BADGES[key]?.emoji || "") + " " + (COIN_BADGES[key]?.label || key)).join(", ") : "нет")
     ].join("\n");
     await saveState();
     await send(chat.id, activityText, message.message_id);
