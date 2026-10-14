@@ -249,9 +249,14 @@ async function handleReportCommand(message, parsed) {
   return true;
 }
 async function handleAppealCommand(message, parsed) {
-  const parts = String(parsed.reason || "").trim().split(/\s+/), chatId = parts.shift() || "", reason = parts.join(" ").trim();
+  const parts = String(parsed.reason || "").trim().split(/\s+/), chatRef = parts.shift() || "", reason = parts.join(" ").trim();
+  let chatId = chatRef;
+  if (/^@[A-Za-z0-9_]{5,32}$/.test(chatRef)) {
+    try { chatId = String((await api("getChat", { chat_id: chatRef })).id); }
+    catch { await send(message.chat.id, "Не удалось найти группу по username. Проверь ссылку или укажи числовой CHAT_ID."); return true; }
+  }
   if (!/^-?\d{5,20}$/.test(chatId) || !reason) {
-    await send(message.chat.id, "Использование: .апелляция CHAT_ID причина\nПример: .апелляция -1001234567890 Прошу пересмотреть бан.");
+    await send(message.chat.id, "Использование: .апелляция CHAT_ID причина или .апелляция @username причина\nПример: .апелляция @mygroup Прошу пересмотреть бан.");
     return true;
   }
   const item = { id: crypto.randomUUID(), status: "open", at: Date.now(), chatId, userId: String(message.from.id), userName: displayName(message.from), reason: reason.slice(0, 500) };
@@ -420,6 +425,7 @@ function startWebPanel() {
         try { member = await api("getChatMember", { chat_id: chatId, user_id: Number(userId) }); }
         catch { html(400, '<h1>Участник не найден в группе</h1><p>Убедитесь, что пользователь состоит в группе и Telegram ID верный.</p><a href="/?chat_id=' + encodeURIComponent(chatId) + '">Назад</a>'); return; }
         if (["creator", "administrator"].includes(member.status)) { html(400, '<h1>Нельзя назначить внутренний уровень настоящему администратору Telegram</h1><a href="/?chat_id=' + encodeURIComponent(chatId) + '">Назад</a>'); return; }
+        if (!["member", "restricted"].includes(member.status) || member.user?.is_bot) { html(400, '<h1>Можно назначить уровень только обычному участнику группы</h1><a href="/?chat_id=' + encodeURIComponent(chatId) + '">Назад</a>'); return; }
         const key = keyFor(chatId, userId);
         if (level === 1) delete state.levels[key]; else state.levels[key] = level;
         await saveState();
