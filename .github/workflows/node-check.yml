@@ -1,0 +1,27 @@
+name: Node syntax check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'index.js'
+      - 'package.json'
+      - '.github/workflows/node-check.yml'
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Check JavaScript syntax
+        run: node --check index.js
+      - name: Verify package metadata
+        run: node -e "const p=require('./package.json'); if(!p.scripts?.start) process.exit(1); console.log('package.json OK')"
