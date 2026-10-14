@@ -81,6 +81,7 @@ async function loadState() {
     state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [], botOwnerId: "", activity: {}, levels: {}, warnLimits: {} };
   }
   if (!state.chatSettings || typeof state.chatSettings !== "object") state.chatSettings = {};
+  if (!state.verifications || typeof state.verifications !== "object") state.verifications = {};
   if (!Array.isArray(state.moderationLog)) state.moderationLog = [];
   if (!Array.isArray(state.reports)) state.reports = [];
   if (!Array.isArray(state.appeals)) state.appeals = [];
@@ -283,7 +284,10 @@ async function handleNewMembers(message) {
       await api("restrictChatMember", { chat_id: message.chat.id, user_id: member.id,
         permissions: { can_send_messages: false, can_send_audios: false, can_send_documents: false, can_send_photos: false, can_send_videos: false, can_send_video_notes: false, can_send_voice_notes: false, can_send_polls: false, can_send_other_messages: false, can_add_web_page_previews: false },
         use_independent_chat_permissions: true, until_date: Math.floor(now / 1000) + 120 });
-      await logModeration({ chatId, action: "Защита от рейда: мут на 2 минуты", target: member, reason: "Активен режим рейда" });
+      state.verifications[keyFor(chatId, member.id)] = { expiresAt: now + 120_000 };
+      await saveState();
+      await api("sendMessage", { chat_id: message.chat.id, text: "🛡 Для защиты от рейда нажми кнопку проверки в течение 2 минут. До проверки отправка сообщений временно ограничена.", reply_markup: { inline_keyboard: [[{ text: "✅ Пройти проверку", callback_data: "verify:" + chatId + ":" + member.id }]] } });
+      await logModeration({ chatId, action: "Защита от рейда: проверка новому участнику на 2 минуты", target: member, reason: "Активен режим рейда" });
     } catch (error) { console.error("Could not apply raid restriction:", error.message); }
   }
   if (settings.raidProtection) {
@@ -832,7 +836,38 @@ async function handleChannelEmojiTest(message) {
   return true;
 }
 
+async function handleVerificationCallback(query) {
+  const match = /^verify:([^:]+):(\d+)$/.exec(String(query.data || ""));
+  if (!match) { await api("answerCallbackQuery", { callback_query_id: query.id, text: "Неизвестная проверка." }); return; }
+  const chatId = match[1], targetId = match[2], key = keyFor(chatId, targetId);
+  const verification = state.verifications?.[key];
+  if (!verification || Number(verification.expiresAt) < Date.now()) {
+    if (state.verifications) delete state.verifications[key];
+    await saveState();
+    await api("answerCallbackQuery", { callback_query_id: query.id, text: "Время проверки истекло. Попроси администратора помочь." });
+    return;
+  }
+  if (String(query.from?.id) !== targetId) {
+    await api("answerCallbackQuery", { callback_query_id: query.id, text: "Эта кнопка предназначена другому участнику.", show_alert: true });
+    return;
+  }
+  try {
+    await api("restrictChatMember", { chat_id: chatId, user_id: Number(targetId),
+      permissions: { can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true, can_send_video_notes: true, can_send_voice_notes: true, can_send_polls: true, can_send_other_messages: true, can_add_web_page_previews: true },
+      use_independent_chat_permissions: true });
+    delete state.verifications[key];
+    await saveState();
+    await api("answerCallbackQuery", { callback_query_id: query.id, text: "Проверка пройдена!" });
+    await send(chatId, "✅ " + displayName(query.from) + ", проверка пройдена. Теперь можно писать.");
+    await logModeration({ chatId, action: "Антирейд: проверка пройдена", actor: query.from, target: query.from });
+  } catch (error) {
+    console.error("Could not complete raid verification:", error.message);
+    await api("answerCallbackQuery", { callback_query_id: query.id, text: "Не удалось завершить проверку. Обратись к администратору.", show_alert: true });
+  }
+}
+
 async function handleUpdate(update) {
+  if (update.callback_query) { await handleVerificationCallback(update.callback_query); return; }
   if (update.pre_checkout_query || update.message?.successful_payment) {
     await handleCoinPaymentUpdate(update);
     if (update.pre_checkout_query) return;
@@ -1192,7 +1227,7 @@ async function main() {
       const updates = await api("getUpdates", {
         offset,
         timeout: 50,
-        allowed_updates: ["message", "pre_checkout_query", "my_chat_member"],
+        allowed_updates: ["message", "pre_checkout_query", "my_chat_member", "callback_query"],
       });
       for (const update of updates) {
         offset = update.update_id + 1;
