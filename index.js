@@ -182,7 +182,230 @@ function reasonSuffix(reason) {
   return reason ? `\nПричина: ${reason}` : "";
 }
 
-// EXTRA_FEATURES
+function parseDurationInput(input = "") {
+  const match = /^(\d+)\s*(с|сек(?:унд(?:а|ы)?)?|м|мин(?:ут(?:а|ы)?)?|ч|час(?:а|ов)?|д|дн(?:я|ей)?|день)\s*(.*)$/i.exec(String(input).trim());
+  if (!match) return { matched: false, reason: String(input).trim() };
+  const amount = Number(match[1]), unit = match[2].toLowerCase();
+  const multiplier = unit.startsWith("с") ? 1 : unit.startsWith("м") ? 60 : unit.startsWith("ч") ? 3600 : 86400;
+  const durationSeconds = amount * multiplier;
+  if (!Number.isSafeInteger(durationSeconds) || durationSeconds < 30 || durationSeconds > 366 * 86400) return { matched: true, invalid: true, durationSeconds, reason: match[3].trim() };
+  return { matched: true, durationSeconds, reason: match[3].trim() };
+}
+function chatSettings(chatId) {
+  const s = state.chatSettings?.[String(chatId)] || {};
+  return { antiSpam: s.antiSpam !== false, raidProtection: s.raidProtection !== false, welcomeEnabled: s.welcomeEnabled !== false };
+}
+async function logModeration({ chatId, action, actor, target, reason = "" }) {
+  const item = {
+    id: crypto.randomUUID(), at: Date.now(), chatId: String(chatId),
+    chatTitle: String(state.groupTitles?.[String(chatId)] || chatId), action: String(action),
+    actorId: String(actor?.id || ""), actorName: String(actor ? displayName(actor) : "Anfisa"),
+    targetId: String(target?.id || ""), targetName: String(target ? displayName(target) : ""),
+    reason: String(reason || "").slice(0, 500)
+  };
+  state.moderationLog.unshift(item);
+  state.moderationLog = state.moderationLog.slice(0, 500);
+  await saveState();
+  if (SERVICE_CHAT_ID) {
+    const line = ["🧾 Журнал модерации", "Чат: " + item.chatTitle + " (" + item.chatId + ")", "Действие: " + item.action,
+      item.targetName ? "Участник: " + item.targetName + " (ID " + item.targetId + ")" : "",
+      item.actorName ? "Кто выполнил: " + item.actorName : "", item.reason ? "Причина: " + item.reason : "",
+      "Время: " + new Date(item.at).toLocaleString("ru-RU", { timeZone: "Europe/Moscow" })].filter(Boolean).join("\n");
+    try { await send(SERVICE_CHAT_ID, line); } catch (error) { console.error("Could not send moderation log:", error.message); }
+  }
+  return item;
+}
+async function notifyHelpers(text) {
+  if (SERVICE_CHAT_ID) try { await send(SERVICE_CHAT_ID, text); } catch (error) { console.error("Service notification failed:", error.message); }
+  for (const id of HELPER_USER_IDS) try { await send(id, text); } catch (error) { console.error("Helper notification failed:", error.message); }
+}
+async function handleReportCommand(message, parsed) {
+  const replied = message.reply_to_message, target = replied?.from;
+  if (!replied || !target || target.is_bot) {
+    await send(message.chat.id, "Ответь командой .репорт на сообщение, на которое хочешь пожаловаться. Причину можно указать после команды.", message.message_id);
+    return true;
+  }
+  const item = { id: crypto.randomUUID(), status: "open", at: Date.now(), chatId: String(message.chat.id),
+    chatTitle: String(message.chat.title || message.chat.id), reporterId: String(message.from.id), reporterName: displayName(message.from),
+    targetId: String(target.id), targetName: displayName(target),
+    reason: String(parsed.reason || replied.text || replied.caption || "Причина не указана").slice(0, 500) };
+  state.reports.unshift(item); state.reports = state.reports.slice(0, 300);
+  await saveState();
+  await send(message.chat.id, "✅ Жалоба передана модераторам и добавлена в журнал.", message.message_id);
+  await notifyHelpers("🚨 Новая жалоба Anfisa\nЧат: " + item.chatTitle + " (" + item.chatId + ")\nНа кого: " + item.targetName + " (ID " + item.targetId + ")\nОт: " + item.reporterName + "\nПричина: " + item.reason + "\nID: " + item.id);
+  return true;
+}
+async function handleAppealCommand(message, parsed) {
+  const parts = String(parsed.reason || "").trim().split(/\s+/), chatId = parts.shift() || "", reason = parts.join(" ").trim();
+  if (!/^-?\d{5,20}$/.test(chatId) || !reason) {
+    await send(message.chat.id, "Использование: .апелляция CHAT_ID причина\nПример: .апелляция -1001234567890 Прошу пересмотреть бан.");
+    return true;
+  }
+  const item = { id: crypto.randomUUID(), status: "open", at: Date.now(), chatId, userId: String(message.from.id), userName: displayName(message.from), reason: reason.slice(0, 500) };
+  state.appeals.unshift(item); state.appeals = state.appeals.slice(0, 300);
+  await saveState();
+  await send(message.chat.id, "✅ Апелляция отправлена модераторам. Номер: " + item.id);
+  await notifyHelpers("📨 Новая апелляция\nПользователь: " + item.userName + " (ID " + item.userId + ")\nЧат: " + item.chatId + "\nПричина: " + item.reason + "\nID: " + item.id);
+  return true;
+}
+async function handleSettingsCommand(message, parsed) {
+  let authorized = false;
+  try { authorized = await isAdmin(message.chat.id, message.from.id); } catch {}
+  if (!authorized) { await send(message.chat.id, "⛔ Настройки может менять только администратор группы.", message.message_id); return true; }
+  const key = parsed.action === "antiSpam" ? "antiSpam" : parsed.action === "raid" ? "raidProtection" : "welcomeEnabled";
+  const label = key === "antiSpam" ? "антиспам" : key === "raidProtection" ? "защита от рейдов" : "приветствия";
+  const args = String(parsed.reason || "").trim().toLowerCase();
+  if (!args) {
+    await send(message.chat.id, "⚙️ " + label + ": " + (chatSettings(message.chat.id)[key] ? "включено" : "выключено") + ". Укажи вкл или выкл.", message.message_id);
+    return true;
+  }
+  const on = ["вкл", "включить", "on", "да"].includes(args), off = ["выкл", "выключить", "off", "нет"].includes(args);
+  if (!on && !off) { await send(message.chat.id, "Укажи «вкл» или «выкл».", message.message_id); return true; }
+  state.chatSettings[String(message.chat.id)] = { ...chatSettings(message.chat.id), [key]: on };
+  await saveState();
+  await send(message.chat.id, (on ? "✅ Включено: " : "⏸ Выключено: ") + label + ".", message.message_id);
+  await logModeration({ chatId: message.chat.id, action: "Настройка: " + label + " " + (on ? "включена" : "выключена"), actor: message.from });
+  return true;
+}
+async function handleNewMembers(message) {
+  const chatId = String(message.chat.id), settings = chatSettings(chatId), now = Date.now();
+  const members = (message.new_chat_members || []).filter((member) => !member.is_bot);
+  const recent = (joinsPerChat.get(chatId) || []).filter((time) => now - time < 60_000);
+  const raidActive = settings.raidProtection && (raidUntilByChat.get(chatId) || 0) > now;
+  if (raidActive) for (const member of members) {
+    try {
+      await api("restrictChatMember", { chat_id: message.chat.id, user_id: member.id,
+        permissions: { can_send_messages: false, can_send_audios: false, can_send_documents: false, can_send_photos: false, can_send_videos: false, can_send_video_notes: false, can_send_voice_notes: false, can_send_polls: false, can_send_other_messages: false, can_add_web_page_previews: false },
+        use_independent_chat_permissions: true, until_date: Math.floor(now / 1000) + 120 });
+      await logModeration({ chatId, action: "Защита от рейда: мут на 2 минуты", target: member, reason: "Активен режим рейда" });
+    } catch (error) { console.error("Could not apply raid restriction:", error.message); }
+  }
+  if (settings.raidProtection) {
+    for (const member of members) recent.push(now);
+    joinsPerChat.set(chatId, recent);
+    if (recent.length >= 5 && (raidUntilByChat.get(chatId) || 0) <= now) {
+      raidUntilByChat.set(chatId, now + 10 * 60_000);
+      try { await send(message.chat.id, "🚨 Anfisa включила защиту от рейда на 10 минут: в группу вошло 5+ участников за минуту.", message.message_id); } catch {}
+      await notifyHelpers("🚨 Защита от рейда активирована\nЧат: " + (message.chat.title || chatId) + " (" + chatId + ")\nПричина: 5+ новых участников за минуту.");
+      await logModeration({ chatId, action: "Автоматически включена защита от рейда", reason: "5+ новых участников за 60 секунд" });
+    }
+  }
+  if (settings.welcomeEnabled && members.length) {
+    await send(message.chat.id, "👋 Добро пожаловать в " + (message.chat.title || "нашу группу") + ", " + members.slice(0, 8).map(displayName).join(", ") + "!\nПожалуйста, соблюдайте правила. Чтобы сообщить о нарушении, ответь на сообщение командой .репорт.");
+  }
+}
+async function runAntiSpam(message) {
+  const chatId = String(message.chat.id);
+  if (!chatSettings(chatId).antiSpam || message.from?.is_bot) return false;
+  let protectedMember = false;
+  try { protectedMember = await isProtected(chatId, message.from.id); } catch { protectedMember = true; }
+  if (protectedMember) return false;
+  const text = String(message.text || message.caption || "").trim();
+  const fingerprint = (text || (message.photo ? "[photo]" : message.sticker ? "[sticker]" : message.document ? "[document]" : "[media]")).toLowerCase().replace(/\s+/g, " ").slice(0, 600);
+  const key = chatId + ":" + message.from.id, now = Date.now();
+  const events = (recentMessages.get(key) || []).filter((event) => now - event.at <= 60_000);
+  events.push({ at: now, fingerprint, hasLink: /https?:\/\/|t\.me\/|telegram\.me\//i.test(text) });
+  recentMessages.set(key, events);
+  const fast = events.filter((event) => now - event.at <= 10_000), repeated = events.filter((event) => event.fingerprint === fingerprint), links = events.filter((event) => event.hasLink && now - event.at <= 20_000);
+  const reasons = [];
+  if (fast.length >= 12) reasons.push("флуд: 12 сообщений за 10 секунд");
+  if (text.length >= 4 && repeated.length >= 3) reasons.push("повторяющиеся сообщения");
+  if (links.length >= 4) reasons.push("массовая отправка ссылок");
+  if (!reasons.length) return false;
+  let deleted = false;
+  try { await api("deleteMessage", { chat_id: message.chat.id, message_id: message.message_id }); deleted = true; } catch (error) { console.error("Could not delete spam:", error.message); }
+  const reason = reasons.join("; ");
+  await logModeration({ chatId, action: "Антиспам: " + (deleted ? "сообщение удалено" : "спам обнаружен"), target: message.from, reason });
+  if (reasons.some((value) => value.startsWith("флуд") || value.startsWith("повторяющиеся"))) {
+    try {
+      await api("restrictChatMember", { chat_id: message.chat.id, user_id: message.from.id,
+        permissions: { can_send_messages: false, can_send_audios: false, can_send_documents: false, can_send_photos: false, can_send_videos: false, can_send_video_notes: false, can_send_voice_notes: false, can_send_polls: false, can_send_other_messages: false, can_add_web_page_previews: false },
+        use_independent_chat_permissions: true, until_date: Math.floor(now / 1000) + 300 });
+      await logModeration({ chatId, action: "Антиспам: мут на 5 минут", target: message.from, reason });
+      try { await send(message.chat.id, "🔇 Anfisa временно ограничила участника за спам на 5 минут."); } catch {}
+    } catch (error) { console.error("Could not restrict spammer:", error.message); }
+  }
+  recentMessages.set(key, []);
+  return true;
+}
+function panelSession(request) {
+  const cookie = String(request.headers.cookie || "").split(";").map((part) => part.trim()).find((part) => part.startsWith("anfisa_session="));
+  const token = cookie ? cookie.slice("anfisa_session=".length) : "", expiry = PANEL_SESSIONS.get(token);
+  if (!expiry || expiry < Date.now()) { if (token) PANEL_SESSIONS.delete(token); return false; }
+  return true;
+}
+function panelLoginPage(error = "") {
+  return '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Anfisa</title><style>body{margin:0;background:#07151e;color:#eaf7f7;font:16px system-ui;display:grid;min-height:100vh;place-items:center}main{width:min(420px,90vw);padding:28px;border:1px solid #087d77;border-radius:20px;background:#0c222d}h1{color:#39e7b1}input,button{width:100%;padding:13px;box-sizing:border-box;border-radius:10px;margin-top:10px;background:#06151e;color:#fff;border:1px solid #235e64}button{background:#11ba8c;color:#06221c;font-weight:700}.error{color:#ff7c8b}</style><main><h1>Anfisa | CHAT-MANAGER</h1><p>Защищённая панель управления группами.</p>' +
+    (error ? '<p class="error">' + escapeHtml(error) + '</p>' : '') +
+    '<form method="post" action="/login"><label>Пароль панели<input type="password" name="password" required autocomplete="current-password"></label><button>Войти</button></form></main></html>';
+}
+function panelPage(selectedChatId = "") {
+  const groups = [...new Set((state.groupIds || []).map(String))];
+  if (!selectedChatId || !groups.includes(selectedChatId)) selectedChatId = groups[0] || "";
+  const settings = chatSettings(selectedChatId), title = state.groupTitles?.[selectedChatId] || selectedChatId || "Группы пока не обнаружены";
+  const groupOptions = groups.map((id) => '<option value="' + escapeHtml(id) + '"' + (id === selectedChatId ? " selected" : "") + '>' + escapeHtml(state.groupTitles?.[id] || id) + ' (' + escapeHtml(id) + ')</option>').join("");
+  const prefix = selectedChatId + ":";
+  const activity = Object.entries(state.activity || {}).filter(([key, events]) => key.startsWith(prefix) && Array.isArray(events)).reduce((sum, pair) => sum + pair[1].filter((time) => Number(time) > Date.now() - 86400000).length, 0);
+  const warnings = Object.entries(state.warnings || {}).filter(([key, value]) => key.startsWith(prefix) && Number(value) > 0).reduce((sum, pair) => sum + Number(pair[1]), 0);
+  const logs = (state.moderationLog || []).filter((item) => !selectedChatId || item.chatId === selectedChatId).slice(0, 20);
+  const logRows = logs.map((item) => '<tr><td>' + escapeHtml(new Date(item.at).toLocaleString("ru-RU")) + '</td><td>' + escapeHtml(item.action) + '</td><td>' + escapeHtml(item.targetName || "") + '</td><td>' + escapeHtml(item.actorName || "") + '</td><td>' + escapeHtml(item.reason || "") + '</td></tr>').join("");
+  const reports = (state.reports || []).filter((item) => item.status === "open" && (!selectedChatId || item.chatId === selectedChatId)).slice(0, 20);
+  const appeals = (state.appeals || []).filter((item) => item.status === "open" && (!selectedChatId || item.chatId === selectedChatId)).slice(0, 20);
+  const row = (item, type, label, who, desc) => '<tr><td>' + label + '</td><td>' + escapeHtml(who) + '</td><td>' + escapeHtml(desc) + '</td><td><form method="post" action="/case"><input type="hidden" name="type" value="' + type + '"><input type="hidden" name="id" value="' + escapeHtml(item.id) + '"><input type="hidden" name="chat_id" value="' + escapeHtml(selectedChatId) + '"><select name="status"><option value="reviewed">На рассмотрении</option><option value="resolved">Решено</option><option value="rejected">Отклонено</option></select><button>Сохранить</button></form></td></tr>';
+  const cases = reports.map((item) => row(item, "report", "Жалоба", item.reporterName + " → " + item.targetName, item.reason)).concat(appeals.map((item) => row(item, "appeal", "Апелляция", item.userName, "Чат " + item.chatId + ": " + item.reason))).join("");
+  return '<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Anfisa | Панель</title><style>*{box-sizing:border-box}body{margin:0;background:#07151e;color:#eaf7f7;font:15px system-ui}header{padding:24px;background:#0c222d;border-bottom:1px solid #087d77;display:flex;justify-content:space-between;gap:20px}h1{margin:0;color:#39e7b1;font-size:24px}main{padding:20px;max-width:1400px;margin:auto}section,.card{padding:16px;border:1px solid #164c55;border-radius:14px;background:#0b202b;margin-bottom:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}.number{font-size:26px;color:#39e7b1;font-weight:bold}h2{font-size:18px;margin:0 0 12px}label{display:inline-flex;gap:8px;margin:8px 14px 8px 0}input,select{padding:8px;background:#06151e;color:#fff;border:1px solid #235e64;border-radius:8px}button{background:#13c99a;border:0;padding:9px 13px;border-radius:8px;font-weight:bold;cursor:pointer}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid #19404a;vertical-align:top}.wrap{overflow:auto}.muted{color:#9fbbc1}td form{display:flex;gap:6px;flex-wrap:wrap}</style>' +
+    '<header><div><h1>Anfisa | CHAT-MANAGER</h1><p>Веб-панель модерации</p></div><form method="post" action="/logout"><button>Выйти</button></form></header><main>' +
+    '<section><h2>Выбор группы</h2><form method="get" action="/"><select name="chat_id">' + groupOptions + '</select> <button>Открыть</button></form><p class="muted">' + escapeHtml(title) + ' · ' + escapeHtml(selectedChatId) + '</p></section>' +
+    '<div class="grid"><div class="card">Сообщений за сутки<div class="number">' + activity + '</div></div><div class="card">Активных варнов<div class="number">' + warnings + '</div></div><div class="card">Открытых жалоб<div class="number">' + reports.length + '</div></div><div class="card">Открытых апелляций<div class="number">' + appeals.length + '</div></div></div>' +
+    '<section><h2>Настройки защиты</h2>' + (selectedChatId ? '<form method="post" action="/settings"><input type="hidden" name="chat_id" value="' + escapeHtml(selectedChatId) + '"><label><input type="checkbox" name="antiSpam" ' + (settings.antiSpam ? 'checked' : '') + '> Антиспам</label><label><input type="checkbox" name="raidProtection" ' + (settings.raidProtection ? 'checked' : '') + '> Защита от рейдов</label><label><input type="checkbox" name="welcomeEnabled" ' + (settings.welcomeEnabled ? 'checked' : '') + '> Приветствия</label><button>Сохранить</button></form>' : '<p>Добавьте Anfisa в группу и отправьте сообщение.</p>') + '</section>' +
+    '<section><h2>Жалобы и апелляции</h2><div class="wrap"><table><tr><th>Тип</th><th>Кто</th><th>Описание</th><th>Статус</th></tr>' + (cases || '<tr><td colspan="4">Открытых обращений нет.</td></tr>') + '</table></div></section>' +
+    '<section><h2>Журнал модерации</h2><div class="wrap"><table><tr><th>Время</th><th>Действие</th><th>Участник</th><th>Кто выполнил</th><th>Причина</th></tr>' + (logRows || '<tr><td colspan="5">Журнал пока пуст.</td></tr>') + '</table></div></section>' +
+    '<p class="muted">Права администратора Telegram нужны для удаления сообщений, банов и мутов.</p></main></html>';
+}
+function startWebPanel() {
+  const server = http.createServer(async (request, response) => {
+    const url = new URL(request.url || "/", "http://localhost");
+    const html = (status, body, headers = {}) => { response.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...headers }); response.end(body); };
+    const redirect = (location, headers = {}) => { response.writeHead(303, { Location: location, ...headers }); response.end(); };
+    const readForm = async () => { let body = ""; for await (const chunk of request) { body += chunk; if (body.length > 10000) throw new Error("Form body too large"); } return new URLSearchParams(body); };
+    if (url.pathname === "/healthz") { response.writeHead(200, { "Content-Type": "text/plain" }); response.end("ok"); return; }
+    if (!PANEL_PASSWORD) { html(503, '<!doctype html><meta charset=utf-8><h1>Панель не настроена</h1><p>Задайте PANEL_PASSWORD в переменных окружения хостинга.</p>'); return; }
+    try {
+      if (url.pathname === "/login" && request.method === "POST") {
+        const form = await readForm(), supplied = Buffer.from(String(form.get("password") || "")), expected = Buffer.from(PANEL_PASSWORD);
+        if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) { html(401, panelLoginPage("Неверный пароль.")); return; }
+        const token = crypto.randomBytes(32).toString("hex"); PANEL_SESSIONS.set(token, Date.now() + 12 * 3600000);
+        const https = request.socket.encrypted || String(request.headers["x-forwarded-proto"] || "").split(",")[0] === "https";
+        redirect("/", { "Set-Cookie": "anfisa_session=" + token + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200" + (https ? "; Secure" : "") }); return;
+      }
+      if (!panelSession(request)) { html(200, panelLoginPage()); return; }
+      if (url.pathname === "/logout" && request.method === "POST") {
+        const cookie = String(request.headers.cookie || "").split(";").map((part) => part.trim()).find((part) => part.startsWith("anfisa_session="));
+        if (cookie) PANEL_SESSIONS.delete(cookie.slice("anfisa_session=".length));
+        redirect("/", { "Set-Cookie": "anfisa_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" }); return;
+      }
+      if (url.pathname === "/settings" && request.method === "POST") {
+        const form = await readForm(), chatId = String(form.get("chat_id") || "");
+        if (!(state.groupIds || []).map(String).includes(chatId)) { html(400, panelPage()); return; }
+        state.chatSettings[chatId] = { antiSpam: form.get("antiSpam") === "on", raidProtection: form.get("raidProtection") === "on", welcomeEnabled: form.get("welcomeEnabled") === "on" };
+        await saveState(); redirect("/?chat_id=" + encodeURIComponent(chatId)); return;
+      }
+      if (url.pathname === "/case" && request.method === "POST") {
+        const form = await readForm(), type = String(form.get("type") || ""), id = String(form.get("id") || ""), status = String(form.get("status") || "");
+        const list = type === "report" ? state.reports : type === "appeal" ? state.appeals : null;
+        if (!list || !["reviewed", "resolved", "rejected"].includes(status)) { html(400, panelPage()); return; }
+        const item = list.find((entry) => entry.id === id);
+        if (item) { item.status = status; item.reviewedAt = Date.now(); await saveState(); }
+        redirect("/?chat_id=" + encodeURIComponent(String(form.get("chat_id") || ""))); return;
+      }
+      if (request.method !== "GET" || url.pathname !== "/") { response.writeHead(404, { "Content-Type": "text/plain" }); response.end("Not found"); return; }
+      html(200, panelPage(url.searchParams.get("chat_id") || ""));
+    } catch (error) { console.error("Web panel request failed:", error); html(500, '<!doctype html><meta charset=utf-8><h1>Ошибка панели</h1>'); }
+  });
+  server.listen(PORT, "0.0.0.0", () => console.log("Anfisa web panel listening on port " + PORT + (PANEL_PASSWORD ? "" : " (set PANEL_PASSWORD to enable access)")));
+}
+
+
 
 async function handleServiceCommand(message, parsed) {
   const chatId = String(message.chat.id);
