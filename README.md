@@ -32,6 +32,9 @@ Commands that act on a member are used as a reply to their message:
 - `.рейд вкл/выкл` — toggle join-spike protection; in raid mode new members pass a one-tap check.
 - `.приветствие вкл/выкл` — toggle welcome messages.
 - `.апелляция CHAT_ID reason` — submit an appeal in the bot's private chat.
+- `.магазин` — open the cosmetic badge shop (15/25/50 Анфисокоинов).
+- `.купитьзначок щит`, `.купитьзначок звезда` or `.купитьзначок корона` — buy a decorative badge.
+- `.значок` — display owned badges; `.топкоинов` — show the coin leaderboard.
 
 Temporary durations support seconds, minutes, hours, or days; Telegram requires a duration of at least 30 seconds and at most 366 days. The bot needs administrator rights to delete messages, restrict members or ban members.
 
