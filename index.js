@@ -1,5 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import http from "node:http";
+import crypto from "node:crypto";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ALLOWED_CHAT_IDS = new Set(
@@ -21,9 +23,15 @@ const SERVICE_CHAT_ID = process.env.SERVICE_CHAT_ID || "";
 const BOT_OWNER_ID = String(process.env.BOT_OWNER_ID || "").trim();
 const UPDATE_CHANNEL_ID = String(process.env.UPDATE_CHANNEL_ID || "@anfisa_kanal_bot").trim();
 const HELPER_USER_IDS = new Set((process.env.HELPER_USER_IDS || "").split(",").map((v) => v.trim()).filter(Boolean));
+const PANEL_PASSWORD = String(process.env.PANEL_PASSWORD || "");
+const PORT = Number(process.env.PORT || 3000);
+const PANEL_SESSIONS = new Map();
+const recentMessages = new Map();
+const joinsPerChat = new Map();
+const raidUntilByChat = new Map();
 const GRID_BAN_CONCURRENCY = 5;
 let offset = 0;
-let state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [], activity: {}, levels: {} };
+let state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [], activity: {}, levels: {}, chatSettings: {}, moderationLog: [], reports: [], appeals: [], groupTitles: {} };
 let saving = Promise.resolve();
 
 const aliases = {
@@ -46,6 +54,12 @@ const aliases = {
   promote: new Set(["повысить", ".повысить"]),
   warnLimit: new Set(["+варнлимит", "варнлимит", ".варнлимит"]),
   summon: new Set([".позвать", "позвать"]),
+  report: new Set([".репорт", "репорт"]),
+  appeal: new Set([".апелляция", "апелляция"]),
+  stats: new Set([".статистика", "статистика"]),
+  antiSpam: new Set([".антиспам", "антиспам"]),
+  raid: new Set([".рейд", "рейд", ".рейдзащита", "рейдзащита"]),
+  welcome: new Set([".приветствие", "приветствие"]),
   emojiTest: new Set([".эмодзитест", "эмодзитест"]),
   emojiChannelTest: new Set([".тестэмодзиканал"]),
 };
@@ -66,6 +80,12 @@ async function loadState() {
     if (error.code !== "ENOENT") console.error("Could not load data.json:", error);
     state = { warnings: {}, groupIds: [], helperLastSeen: {}, balances: {}, processedPayments: [], botOwnerId: "", activity: {}, levels: {}, warnLimits: {} };
   }
+  if (!state.chatSettings || typeof state.chatSettings !== "object") state.chatSettings = {};
+  if (!Array.isArray(state.moderationLog)) state.moderationLog = [];
+  if (!Array.isArray(state.reports)) state.reports = [];
+  if (!Array.isArray(state.appeals)) state.appeals = [];
+  if (!state.groupTitles || typeof state.groupTitles !== "object") state.groupTitles = {};
+  if (!state.warnLimits || typeof state.warnLimits !== "object") state.warnLimits = {};
 }
 
 function saveState() {
@@ -161,6 +181,8 @@ async function isProtected(chatId, userId) {
 function reasonSuffix(reason) {
   return reason ? `\nПричина: ${reason}` : "";
 }
+
+// EXTRA_FEATURES
 
 async function handleServiceCommand(message, parsed) {
   const chatId = String(message.chat.id);
@@ -600,12 +622,15 @@ async function handleUpdate(update) {
     return;
   }
   const message = update.message;
-  if (!message?.chat || !message.from || typeof message.text !== "string") return;
+  if (!message?.chat || !message.from) return;
+  const messageText = typeof message.text === "string" ? message.text : typeof message.caption === "string" ? message.caption : "";
+  if (!messageText && !Array.isArray(message.new_chat_members)) return;
 
   const chat = message.chat;
   const sender = message.from;
-  const parsed = parseCommand(message.text);
+  const parsed = parseCommand(messageText);
   if (chat.type === "private") {
+    if (parsed?.action === "appeal") { await handleAppealCommand(message, parsed); return; }
     if (parsed?.action === "emojiTest") { await handleEmojiTest(message); return; }
     if (parsed?.action === "emojiChannelTest") { await handleChannelEmojiTest(message); return; }
     if (parsed && ["buy", "transfer", "service", "balance", "grant"].includes(parsed.action)) await handleCoinCommand(message, parsed);
@@ -616,6 +641,8 @@ async function handleUpdate(update) {
 
   // Count each message as activity for rolling day/week/month/year statistics.
   recordActivity(chat.id, sender.id);
+  if (!state.groupTitles || typeof state.groupTitles !== "object") state.groupTitles = {};
+  state.groupTitles[String(chat.id)] = String(chat.title || chat.id);
   // Remember groups where Telegram has delivered an update. Persist helper activity for .онлайн.
   if (!Array.isArray(state.groupIds)) state.groupIds = [];
   if (!state.groupIds.includes(String(chat.id))) {
@@ -627,8 +654,28 @@ async function handleUpdate(update) {
     await saveState();
   }
 
-  if (!parsed) { await saveState(); return; }
+  if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) {
+    await handleNewMembers(message);
+    await saveState();
+    return;
+  }
+  if (!parsed) { await runAntiSpam(message); await saveState(); return; }
+  if (parsed.action === "report") { await handleReportCommand(message, parsed); return; }
+  if (["antiSpam", "raid", "welcome"].includes(parsed.action)) { await handleSettingsCommand(message, parsed); return; }
   if (["buy", "transfer", "service", "balance", "grant"].includes(parsed.action)) { await handleCoinCommand(message, parsed); return; }
+
+  if (parsed.action === "stats") {
+    let authorized = false;
+    try { authorized = await isAdmin(chat.id, sender.id); } catch {}
+    if (!authorized) { await send(chat.id, "⛔ Статистика группы доступна только администраторам.", message.message_id); return; }
+    const prefix = String(chat.id) + ":";
+    const messagesToday = Object.entries(state.activity || {}).filter(([key, events]) => key.startsWith(prefix) && Array.isArray(events)).reduce((sum, [, events]) => sum + events.filter((time) => Number(time) > Date.now() - 24 * 60 * 60 * 1000).length, 0);
+    const activeUsers = Object.entries(state.activity || {}).filter(([key, events]) => key.startsWith(prefix) && Array.isArray(events) && events.some((time) => Number(time) > Date.now() - 24 * 60 * 60 * 1000)).length;
+    const warnings = Object.entries(state.warnings || {}).filter(([key, count]) => key.startsWith(prefix) && Number(count) > 0).reduce((sum, [, count]) => sum + Number(count), 0);
+    const openReports = (state.reports || []).filter((item) => item.chatId === String(chat.id) && item.status === "open").length;
+    await send(chat.id, "📊 Статистика группы\nСообщений за сутки: " + messagesToday + "\nАктивных участников за сутки: " + activeUsers + "\nАктивных варнов: " + warnings + "\nОткрытых жалоб: " + openReports, message.message_id);
+    return;
+  }
 
   if (parsed.action === "profile") {
     const target = message.reply_to_message?.from || sender;
@@ -748,6 +795,12 @@ async function handleUpdate(update) {
       "• мут / .мут / mut — запрет писать\n" +
       "• размут / .размут / unmute — снять мут\n" +
       "• варны / .варны / warns — число предупреждений\n" +
+      "• .мут 10м / .бан 1д — временное наказание (ответом на сообщение)\n" +
+      "• .антиспам вкл/выкл — фильтр флуда и повторов\n" +
+      "• .рейд вкл/выкл — защита от рейдов\n" +
+      "• .приветствие вкл/выкл — приветствия при входе\n" +
+      "• .репорт — ответом на сообщение, пожаловаться модераторам\n" +
+      "• .статистика — сводка группы\n" +
       "• помощь / .помощь / help — эта справка",
       message.message_id);
     return;
@@ -807,7 +860,14 @@ async function handleUpdate(update) {
   }
 
   const targetName = displayName(target);
-  const reason = parsed.reason;
+  const durationInput = (parsed.action === "ban" || parsed.action === "mute") ? parseDurationInput(parsed.reason) : { matched: false, reason: parsed.reason };
+  if (durationInput.matched && durationInput.invalid) {
+    await send(chat.id, "⛔ Длительность должна быть от 30 секунд до 366 дней. Примеры: .мут 10м, .бан 1д.", message.message_id);
+    return;
+  }
+  const reason = durationInput.matched ? durationInput.reason : parsed.reason;
+  const untilDate = durationInput.matched ? Math.floor(Date.now() / 1000) + durationInput.durationSeconds : undefined;
+  const durationText = durationInput.matched ? " на " + Math.round(durationInput.durationSeconds / 60) + " мин." : "";
 
   try {
     switch (parsed.action) {
@@ -824,16 +884,19 @@ async function handleUpdate(update) {
           await send(chat.id,
             `⛔ ${targetName} достиг(ла) лимита в ${warnLimit(chat.id)} предупреждений и забанен(а).${reasonSuffix(reason)}`,
             message.message_id);
+          await logModeration({ chatId: chat.id, action: "Автобан за лимит предупреждений", actor: sender, target, reason: reason || (count + "/" + warnLimit(chat.id) + " варнов") });
         } else {
           await send(chat.id,
             `⚠️ Предупреждение ${count}/${warnLimit(chat.id)} для ${targetName}.${reasonSuffix(reason)}`,
             message.message_id);
+          await logModeration({ chatId: chat.id, action: "Предупреждение " + count + "/" + warnLimit(chat.id), actor: sender, target, reason });
         }
         break;
       }
       case "ban":
-        await api("banChatMember", { chat_id: chat.id, user_id: target.id });
-        await send(chat.id, `⛔ ${targetName} забанен(а) администратором ${displayName(sender)}.${reasonSuffix(reason)}`, message.message_id);
+        await api("banChatMember", { chat_id: chat.id, user_id: target.id, ...(untilDate ? { until_date: untilDate } : {}) });
+        await send(chat.id, `⛔ ${targetName} забанен(а) администратором ${displayName(sender)}${durationText}.${reasonSuffix(reason)}`, message.message_id);
+        await logModeration({ chatId: chat.id, action: "Бан" + durationText, actor: sender, target, reason });
         break;
       case "mute":
         await api("restrictChatMember", {
@@ -852,8 +915,10 @@ async function handleUpdate(update) {
             can_add_web_page_previews: false,
           },
           use_independent_chat_permissions: true,
+          ...(untilDate ? { until_date: untilDate } : {}),
         });
-        await send(chat.id, `🔇 ${targetName} получил(а) мут до снятия администратором.${reasonSuffix(reason)}`, message.message_id);
+        await send(chat.id, `🔇 ${targetName} получил(а) мут${durationInput.matched ? " на " + Math.round(durationInput.durationSeconds / 60) + " мин." : " до снятия администратором"}.${reasonSuffix(reason)}`, message.message_id);
+        await logModeration({ chatId: chat.id, action: "Мут" + durationText, actor: sender, target, reason });
         break;
       case "unmute":
         await api("restrictChatMember", {
@@ -874,6 +939,7 @@ async function handleUpdate(update) {
           use_independent_chat_permissions: true,
         });
         await send(chat.id, `🔊 Мут для ${targetName} снят.`, message.message_id);
+        await logModeration({ chatId: chat.id, action: "Мут снят", actor: sender, target, reason });
         break;
       default:
         break;
@@ -888,6 +954,7 @@ async function handleUpdate(update) {
 
 async function main() {
   await loadState();
+  startWebPanel();
   const me = await api("getMe");
   console.log(`Started ${me.first_name}${me.username ? ` (@${me.username})` : ""}. Polling Telegram updates...`);
 
